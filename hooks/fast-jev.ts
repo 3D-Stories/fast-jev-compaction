@@ -443,6 +443,19 @@ export async function compactSession(
   return { result, messages: toSessionMessages(messages, result.messages) };
 }
 
+/**
+ * Drops the engine's `handle` so each kept message is persisted as a fresh record
+ * after the compact boundary. With handles, kept tool_result records keep a
+ * parentUuid behind the boundary and kept assistant records keep their
+ * message.id, so `--resume` walks back into the full pre-compaction history
+ * (fast-jev-compaction#89, anthropics/claude-code#95328). Costs the engine's own
+ * bookkeeping for those records (hidden reasoning, images), not their text or tool pairs.
+ * PROBE ONLY: copied from tamaratran/fast-jev-compaction#98 (socialadsmentor).
+ */
+export function withoutHandles(messages: readonly SessionMessage[]): SessionMessage[] {
+  return messages.map(({ handle: _handle, ...rest }) => rest);
+}
+
 function percent(ratio: number): string {
   return `${Math.round(ratio * 100)}%`;
 }
@@ -575,7 +588,7 @@ export const register: Register = (on: On, options: PluginOptions) => {
         $,
         `kept ${messages.length}/${event.messages.length} messages, no summary (${summarize(result)})`,
       );
-      return { messages };
+      return { messages: withoutHandles(messages) };
     } catch (error) {
       notify(
         $,
