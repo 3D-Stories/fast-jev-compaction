@@ -269,20 +269,34 @@ type ProcessAccess = {
   };
 };
 
-/** The log lines holding any of `patterns`, found by `grep -F`, so the log is never loaded whole. */
+/**
+ * The log lines matching any of `patterns` (extended regular expressions), found
+ * by `grep -E`, so the log is never loaded whole. Throws rather than return a
+ * partial answer: grep's exit 1 means no match only when it printed nothing,
+ * output that does not end in a newline was cut at the process output limit,
+ * and a printed line that is not JSON was cut too.
+ */
 async function grepEntries($: ProcessAccess, path: string, patterns: readonly string[]): Promise<LogEntry[]> {
   const entries: LogEntry[] = [];
   for (let i = 0; i < patterns.length; i += 200) {
-    const argv = ['grep', '-F', ...patterns.slice(i, i + 200).flatMap((pattern) => ['-e', pattern]), '--', path];
+    const argv = ['grep', '-E', ...patterns.slice(i, i + 200).flatMap((pattern) => ['-e', pattern]), '--', path];
     const { exitCode, stdout, stderr } = await $.process.run(argv, { timeoutMs: 60_000 });
-    if (exitCode > 1) throw new Error(`grep exited ${exitCode}: ${stderr.trim().slice(0, 200)}`);
+    if (exitCode > 1 || (exitCode === 1 && stdout !== '')) {
+      throw new Error(`grep exited ${exitCode}: ${stderr.trim().slice(0, 200)}`);
+    }
+    if (stdout !== '' && !stdout.endsWith('\n')) throw new Error('grep output was cut at the output limit');
     for (const line of stdout.split('\n')) {
+      if (line === '') continue;
       const entry = parseLine(line);
-      if (entry) entries.push(entry);
+      if (!entry) throw new Error('grep printed a line that is not JSON');
+      entries.push(entry);
     }
   }
   return entries;
 }
+
+/** A uuid as Claude Code writes them; anything else is never put into a grep pattern. */
+const PLAIN_ID = /^[A-Za-z0-9_-]+$/;
 
 /**
  * The same answer as `queuedPromptToolUseIds`, for a log too large to read
@@ -293,10 +307,11 @@ export async function queuedPromptToolUseIdsByGrep($: ProcessAccess, path: strin
   const notes = (await grepEntries($, path, ['"queued_command"'])).filter(typedByPerson);
   const entries = new Map<string, LogEntry>();
   const asked = new Set<string>();
-  let wanted = new Set(notes.map((note) => note.parentUuid).filter((uuid): uuid is string => !!uuid));
+  const plain = (uuid: string | null | undefined): uuid is string => !!uuid && PLAIN_ID.test(uuid);
+  let wanted = new Set(notes.map((note) => note.parentUuid).filter(plain));
   while (wanted.size > 0) {
     for (const uuid of wanted) asked.add(uuid);
-    for (const entry of await grepEntries($, path, [...wanted].map((uuid) => `"uuid":"${uuid}"`))) {
+    for (const entry of await grepEntries($, path, [...wanted].map((uuid) => `"uuid": ?"${uuid}"`))) {
       if (entry.uuid && wanted.has(entry.uuid)) entries.set(entry.uuid, entry);
     }
     const next = new Set<string>();
@@ -304,7 +319,7 @@ export async function queuedPromptToolUseIdsByGrep($: ProcessAccess, path: strin
       const entry = entries.get(uuid);
       if (!entry || toolResultIds(entry).length > 0 || entry.type !== 'attachment') continue;
       const parent = entry.parentUuid ?? undefined;
-      if (parent && !asked.has(parent)) next.add(parent);
+      if (plain(parent) && !asked.has(parent)) next.add(parent);
     }
     wanted = next;
   }
@@ -506,6 +521,7 @@ export const register: Register = (on: On, options: PluginOptions) => {
   on('session.compact', async ($, event, next) => {
     try {
       const config: HookConfig = { ...configured, apiKey: await getApiKey($, configured) };
+      let typedPins = 0;
       let typedChars = 0;
       if (!event.agentId) {
         try {
@@ -517,6 +533,7 @@ export const register: Register = (on: On, options: PluginOptions) => {
             const pinned = pinnedForQueuedPrompts(event.messages, ids);
             if (pinned.length > 0) {
               config.pinToolUseIds = pinned;
+              typedPins = pinned.length;
               typedChars = resultChars(event.messages, pinned);
               $.ui.log(`keeping ${pinned.length} tool call(s) that carry a message typed while they ran`);
             }
@@ -536,7 +553,7 @@ export const register: Register = (on: On, options: PluginOptions) => {
         notify(
           $,
           `fallback to built-in summary (below ${percent(config.minReductionRatio)} minimum: ${summarize(result)}${
-            typedChars > 0 ? `; kept for typed messages: ${typedChars} chars` : ''
+            typedPins > 0 ? `; kept for typed messages: ${typedPins} call(s), ${typedChars} chars` : ''
           })`,
         );
         return next(event);
