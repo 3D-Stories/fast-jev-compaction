@@ -4,6 +4,7 @@ import {
   pinnedForQueuedPrompts,
   projectDirName,
   queuedPromptToolUseIds,
+  queuedPromptToolUseIdsByGrep,
   register,
   resolveHookConfig,
 } from '../hooks/fast-jev.ts';
@@ -151,6 +152,32 @@ describe('queuedPromptToolUseIds', () => {
   });
 });
 
+describe('queuedPromptToolUseIdsByGrep', () => {
+  function grepAccess(files: Record<string, string>, runs: (readonly string[])[]) {
+    return { process: { run: async (argv: readonly string[]) => (runs.push(argv), fakeGrep(files, argv)) } };
+  }
+
+  it('fetches more than 200 parents in batches of 200 and finds every carrier', async () => {
+    const lines: string[] = [];
+    for (let i = 0; i < 250; i++) {
+      lines.push(toolResultEntry(`u-${i}`, `tool-${i}`), queuedEntry(`q-${i}`, `u-${i}`, 'human'));
+    }
+    const runs: (readonly string[])[] = [];
+    const ids = await queuedPromptToolUseIdsByGrep(grepAccess({ '/log': lines.join('\n') }, runs), '/log');
+    expect(ids.size).toBe(250);
+    const patternCounts = runs.filter((argv) => !argv.includes('-c')).map((argv) => argv.filter((a) => a === '-e').length);
+    expect(patternCounts).toEqual([1, 200, 50]);
+  });
+
+  it('never puts an id with pattern characters into a grep pattern', async () => {
+    const lines = [toolResultEntry('a.b', 'tool-1'), queuedEntry('q-1', 'a.b', 'human')];
+    const runs: (readonly string[])[] = [];
+    const ids = await queuedPromptToolUseIdsByGrep(grepAccess({ '/log': lines.join('\n') }, runs), '/log');
+    expect(ids.size).toBe(0);
+    expect(runs.some((argv) => argv.some((a) => a.includes('a.b')))).toBe(false);
+  });
+});
+
 describe('pinnedForQueuedPrompts', () => {
   it('names every call answered in the message that carries the typed message', () => {
     const messages = [
@@ -195,8 +222,12 @@ type HarnessOptions = {
   /** Folders under ~/.claude/projects that the scan lists. */
   dirs?: string[];
   failProcess?: boolean;
-  /** What the fake process returns instead of grep's answer. */
-  processResult?: { exitCode: number; stdout: string; stderr: string };
+  /** What the fake process returns instead of grep's answer: one result for every run, or one per argv. */
+  processResult?:
+    | { exitCode: number; stdout: string; stderr: string }
+    | ((argv: readonly string[]) => { exitCode: number; stdout: string; stderr: string });
+  /** Environment values the fake engine returns. */
+  env?: Record<string, string>;
 };
 
 /** grep -E -e P1 -e P2 … FILE, as the hook runs it: exit 0 with matches, 1 with none. */
@@ -205,6 +236,7 @@ function fakeGrep(files: Record<string, string>, argv: readonly string[]) {
   for (let i = 0; i < argv.length; i++) if (argv[i] === '-e') patterns.push(new RegExp(argv[++i]!));
   const file = argv[argv.length - 1]!;
   const lines = (files[file] ?? '').split('\n').filter((line) => patterns.some((p) => p.test(line)));
+  if (argv.includes('-c')) return { exitCode: lines.length > 0 ? 0 : 1, stdout: `${lines.length}\n`, stderr: '' };
   return { exitCode: lines.length > 0 ? 0 : 1, stdout: lines.map((l) => `${l}\n`).join(''), stderr: '' };
 }
 
@@ -221,7 +253,7 @@ function hookHarness(files: Record<string, string>, failReadOrOptions: boolean |
   const logs: string[] = [];
   const fetch = jevFetch(0.05);
   const fake = {
-    env: { get: async (name: string) => (name === 'HOME' ? '/home/u' : undefined) },
+    env: { get: async (name: string) => (name in (opts.env ?? {}) ? opts.env![name] : name === 'HOME' ? '/home/u' : undefined) },
     settings: { read: async () => ({}) },
     http: { fetch },
     ui: { log: (text: string) => logs.push(text), toast: () => undefined },
@@ -245,7 +277,9 @@ function hookHarness(files: Record<string, string>, failReadOrOptions: boolean |
       run: async (argv: readonly string[]) => {
         runs.push(argv);
         if (opts.failProcess) throw new Error('grep not found');
-        return opts.processResult ?? fakeGrep(files, argv);
+        const override = opts.processResult;
+        if (typeof override === 'function') return override(argv);
+        return override ?? fakeGrep(files, argv);
       },
     },
   };
@@ -293,7 +327,8 @@ describe('the session.compact hook', () => {
       messages: SessionMessage[];
     };
     expect(out.messages.map((m) => m.handle)).toEqual(['h-0', 'h-tool-1', 'r-tool-1', 'h-5', 'h-6']);
-    expect(runs.length).toBe(4);
+    expect(runs.filter((argv) => !argv.includes('-c')).length).toBe(4);
+    expect(runs.filter((argv) => argv.includes('-c')).length).toBe(4);
   });
 
   it('says plainly that typed messages are not protected when a large log cannot be scanned', async () => {
@@ -345,7 +380,7 @@ describe('the session.compact hook', () => {
     const cut = logLine({ type: 'attachment', uuid: 'q-1', parentUuid: 'u-1', attachment: { type: 'queued_command' } }).slice(0, 40);
     const { handler, fake, logs } = hookHarness(
       { [logPath]: log },
-      { sizes: { [logPath]: 137_000_000 }, processResult: { exitCode: 0, stdout: cut, stderr: '' } },
+      { sizes: { [logPath]: 137_000_000 }, processResult: (argv) => (argv.includes('-c') ? { exitCode: 0, stdout: '1\n', stderr: '' } : { exitCode: 0, stdout: cut, stderr: '' }) },
     );
     await handler(fake, { trigger: 'auto', messages: transcript() }, async () => ({ skip: 'next' }));
     expect(logs.some((line) => line.includes('typed messages are not protected'))).toBe(true);
@@ -355,7 +390,7 @@ describe('the session.compact hook', () => {
     const note = queuedEntry('q-1', 'u-1', 'human');
     const { handler, fake, logs } = hookHarness(
       { [logPath]: log },
-      { sizes: { [logPath]: 137_000_000 }, processResult: { exitCode: 0, stdout: `${note}\n${note}`, stderr: '' } },
+      { sizes: { [logPath]: 137_000_000 }, processResult: (argv) => (argv.includes('-c') ? { exitCode: 0, stdout: '2\n', stderr: '' } : { exitCode: 0, stdout: `${note}\n${note}`, stderr: '' }) },
     );
     await handler(fake, { trigger: 'auto', messages: transcript() }, async () => ({ skip: 'next' }));
     expect(logs.some((line) => line.includes('cut at the output limit') && line.includes('not protected'))).toBe(true);
@@ -364,7 +399,7 @@ describe('the session.compact hook', () => {
   it('does not trust a grep line that is not JSON, even when the output ends in a newline', async () => {
     const { handler, fake, logs } = hookHarness(
       { [logPath]: log },
-      { sizes: { [logPath]: 137_000_000 }, processResult: { exitCode: 0, stdout: '{"type":"attach\n', stderr: '' } },
+      { sizes: { [logPath]: 137_000_000 }, processResult: (argv) => (argv.includes('-c') ? { exitCode: 0, stdout: '1\n', stderr: '' } : { exitCode: 0, stdout: '{"type":"attach\n', stderr: '' }) },
     );
     await handler(fake, { trigger: 'auto', messages: transcript() }, async () => ({ skip: 'next' }));
     expect(logs.some((line) => line.includes('not JSON') && line.includes('not protected'))).toBe(true);
@@ -373,7 +408,7 @@ describe('the session.compact hook', () => {
   it('does not read exit 1 with output as "no match"', async () => {
     const { handler, fake, logs } = hookHarness(
       { [logPath]: log },
-      { sizes: { [logPath]: 137_000_000 }, processResult: { exitCode: 1, stdout: `${log}\n`, stderr: '' } },
+      { sizes: { [logPath]: 137_000_000 }, processResult: (argv) => (argv.includes('-c') ? { exitCode: 0, stdout: '2\n', stderr: '' } : { exitCode: 1, stdout: `${log}\n`, stderr: '' }) },
     );
     await handler(fake, { trigger: 'auto', messages: transcript() }, async () => ({ skip: 'next' }));
     expect(logs.some((line) => line.includes('typed messages are not protected'))).toBe(true);
@@ -382,6 +417,50 @@ describe('the session.compact hook', () => {
   it('finds a parent written with a space after the colon', async () => {
     const spaced = [toolResultEntry('u-1', 'tool-1').replace('"uuid":"u-1"', '"uuid": "u-1"'), queuedEntry('q-1', 'u-1', 'human')].join('\n');
     const { handler, fake } = hookHarness({ [logPath]: spaced }, { sizes: { [logPath]: 137_000_000 } });
+    const out = (await handler(fake, { trigger: 'auto', messages: transcript() }, async () => ({ skip: 'next' }))) as {
+      messages: SessionMessage[];
+    };
+    expect(out.messages.map((m) => m.handle)).toEqual(['h-0', 'h-tool-1', 'r-tool-1', 'h-5', 'h-6']);
+  });
+
+  it('does not trust grep output that holds fewer lines than grep -c counted', async () => {
+    const note = queuedEntry('q-1', 'u-1', 'human');
+    const { handler, fake, logs } = hookHarness(
+      { [logPath]: log },
+      {
+        sizes: { [logPath]: 137_000_000 },
+        processResult: (argv) =>
+          argv.includes('-c') ? { exitCode: 0, stdout: '3\n', stderr: '' } : { exitCode: 0, stdout: `${note}\n`, stderr: '' },
+      },
+    );
+    await handler(fake, { trigger: 'auto', messages: transcript() }, async () => ({ skip: 'next' }));
+    expect(logs.some((line) => line.includes('returned 1 of 3') && line.includes('not protected'))).toBe(true);
+  });
+
+  it('does not read a returned grep exit 2 as an answer', async () => {
+    const { handler, fake, logs } = hookHarness(
+      { [logPath]: log },
+      { sizes: { [logPath]: 137_000_000 }, processResult: { exitCode: 2, stdout: '', stderr: 'grep: bad' } },
+    );
+    await handler(fake, { trigger: 'auto', messages: transcript() }, async () => ({ skip: 'next' }));
+    expect(logs.some((line) => line.includes('exited 2') && line.includes('not protected'))).toBe(true);
+  });
+
+  it('does not trust a grep -c count that came with exit 2', async () => {
+    const { handler, fake, logs } = hookHarness(
+      { [logPath]: log },
+      {
+        sizes: { [logPath]: 137_000_000 },
+        processResult: (argv) =>
+          argv.includes('-c') ? { exitCode: 2, stdout: '1\n', stderr: 'grep: read error' } : fakeGrep({ [logPath]: log }, argv),
+      },
+    );
+    await handler(fake, { trigger: 'auto', messages: transcript() }, async () => ({ skip: 'next' }));
+    expect(logs.some((line) => line.includes('grep -c exited 2') && line.includes('not protected'))).toBe(true);
+  });
+
+  it('finds the session log under HOME when CLAUDE_CONFIG_DIR is set but empty', async () => {
+    const { handler, fake } = hookHarness({ [logPath]: log }, { env: { CLAUDE_CONFIG_DIR: '' } });
     const out = (await handler(fake, { trigger: 'auto', messages: transcript() }, async () => ({ skip: 'next' }))) as {
       messages: SessionMessage[];
     };

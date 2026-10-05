@@ -272,25 +272,38 @@ type ProcessAccess = {
 /**
  * The log lines matching any of `patterns` (extended regular expressions), found
  * by `grep -E`, so the log is never loaded whole. Throws rather than return a
- * partial answer: grep's exit 1 means no match only when it printed nothing,
- * output that does not end in a newline was cut at the process output limit,
- * and a printed line that is not JSON was cut too.
+ * partial answer. `grep -c` counts the matching lines first, and the full grep
+ * must return at least that many: process output is cut at a limit, and a cut
+ * at a line end would otherwise look complete. Exit 1 means no match only with
+ * nothing printed; output that does not end in a newline, or a line that is not
+ * JSON, was cut too.
  */
 async function grepEntries($: ProcessAccess, path: string, patterns: readonly string[]): Promise<LogEntry[]> {
   const entries: LogEntry[] = [];
   for (let i = 0; i < patterns.length; i += 200) {
-    const argv = ['grep', '-E', ...patterns.slice(i, i + 200).flatMap((pattern) => ['-e', pattern]), '--', path];
-    const { exitCode, stdout, stderr } = await $.process.run(argv, { timeoutMs: 60_000 });
+    const expressions = patterns.slice(i, i + 200).flatMap((pattern) => ['-e', pattern]);
+    const counted = await $.process.run(['grep', '-E', '-c', ...expressions, '--', path], { timeoutMs: 60_000 });
+    const expected = Number(counted.stdout.trim());
+    if (counted.exitCode > 1 || !/^\d+\n?$/.test(counted.stdout) || !Number.isSafeInteger(expected)) {
+      throw new Error(`grep -c exited ${counted.exitCode}: ${counted.stderr.trim().slice(0, 200)}`);
+    }
+    if (expected === 0) continue;
+    const { exitCode, stdout, stderr } = await $.process.run(['grep', '-E', ...expressions, '--', path], {
+      timeoutMs: 60_000,
+    });
     if (exitCode > 1 || (exitCode === 1 && stdout !== '')) {
       throw new Error(`grep exited ${exitCode}: ${stderr.trim().slice(0, 200)}`);
     }
     if (stdout !== '' && !stdout.endsWith('\n')) throw new Error('grep output was cut at the output limit');
+    let returned = 0;
     for (const line of stdout.split('\n')) {
       if (line === '') continue;
       const entry = parseLine(line);
       if (!entry) throw new Error('grep printed a line that is not JSON');
       entries.push(entry);
+      returned += 1;
     }
+    if (returned < expected) throw new Error(`grep returned ${returned} of ${expected} matching lines (output cut)`);
   }
   return entries;
 }
