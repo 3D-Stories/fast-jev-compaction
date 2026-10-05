@@ -227,10 +227,15 @@ function isBoundary(entry: LogEntry): boolean {
  * reference. An earlier one was kept (and written again after the boundary),
  * put back as words, or summarized by that compaction. A boundary line that
  * does not parse is not seen, so notes before it count as held and their words
- * can come back twice: a copy is chosen over a loss. On the grep path such a
- * line, when it is the last match, turns protection off for that one
- * compaction, since it cannot be told from a cut (0 lines that do not parse in
- * 871,988 measured on this host).
+ * can come back twice: a copy is chosen over a loss. On the grep path a matched
+ * line that does not parse, while it is the last match, turns protection off,
+ * since it cannot be told from a cut. That lasts until a matching line that
+ * parses is written after it; a write appended to an unfinished line joins it,
+ * so it can last more than one compaction. The boundary pattern asks for
+ * `"subtype":` with no space before the colon, as Claude Code writes it, so a
+ * boundary spelled otherwise is missed and words can come back twice. 0 lines
+ * that do not parse in 871,988, and 192 of 192 boundaries written that way,
+ * measured on this host.
  */
 function stillHeld(ordered: readonly LogEntry[]): LogEntry[] {
   const last = ordered.findLastIndex(isBoundary);
