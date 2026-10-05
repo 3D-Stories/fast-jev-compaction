@@ -179,6 +179,18 @@ describe('typedNotes', () => {
     expect(typedNotes(log)).toEqual([{ toolUseId: 'tool-1', prompt: 'stop after the tests' }]);
   });
 
+  it('knows a copy by its delivery id when the log gives no submission id', () => {
+    const delivered = (uuid: string, parentUuid: string, delivery: string) =>
+      logLine({
+        type: 'attachment',
+        uuid,
+        parentUuid,
+        attachment: { type: 'queued_command', prompt: 'Use staging.', commandMode: 'prompt', origin: { kind: 'human' }, delivery_id: delivery },
+      });
+    const log = [toolResultEntry('u-1', 'tool-1'), delivered('q-1', 'u-1', 'd-1'), delivered('q-2', 'u-1', 'd-1'), delivered('q-3', 'q-2', 'd-2')].join('\n');
+    expect(typedNotes(log).map((note) => note.prompt)).toEqual(['Use staging.', 'Use staging.']);
+  });
+
   it('keeps every submission, in order, even when two have the same words', () => {
     const log = [
       toolResultEntry('u-1', 'tool-1'),
@@ -249,6 +261,47 @@ describe('typedNotesByGrep', () => {
       { toolUseId: 'tool-2', prompt: 'from my phone' },
       { toolUseId: 'tool-4', prompt: 'use the staging key' },
     ]);
+  });
+
+  it('keeps every submission in order, even when two have the same words', async () => {
+    const log = [
+      toolResultEntry('u-1', 'tool-1'),
+      queuedEntry('q-1', 'u-1', 'human', 'prompt', 'Use staging.', false, 's-1'),
+      queuedEntry('q-2', 'q-1', 'human', 'prompt', 'Use production.', false, 's-2'),
+      queuedEntry('q-3', 'q-2', 'human', 'prompt', 'Use staging.', false, 's-3'),
+    ].join('\n');
+    const notes = await typedNotesByGrep(grepAccess({ '/log': log }, []), '/log');
+    expect(notes).toEqual(typedNotes(log));
+    expect(notes.map((note) => note.prompt)).toEqual(['Use staging.', 'Use production.', 'Use staging.']);
+  });
+
+  it('sees a compaction boundary written with spaces or a tab after the colon, as a whole read does', async () => {
+    for (const gap of ['  ', '\t']) {
+      const log = [
+        toolResultEntry('u-1', 'tool-1'),
+        queuedEntry('q-1', 'u-1', 'human', 'prompt', 'already handled', false, 's-1'),
+        boundaryLine().replace('"subtype":"compact_boundary"', `"subtype":${gap}"compact_boundary"`),
+        toolResultEntry('u-2', 'tool-2'),
+        queuedEntry('q-2', 'u-2', 'human', 'prompt', 'still held', false, 's-2'),
+      ].join('\n');
+      const notes = await typedNotesByGrep(grepAccess({ '/log': log }, []), '/log');
+      expect(notes).toEqual(typedNotes(log));
+      expect(notes.map((note) => note.prompt)).toEqual(['still held']);
+    }
+  });
+
+  it('skips a line the log holds unfinished, as a whole read does, when grep printed lines after it', async () => {
+    // A write that never finished leaves part of a line, and the next write joins it.
+    const unfinished = boundaryLine().slice(0, 50) + queuedEntry('q-0', 'u-1', 'human', 'prompt', 'half written');
+    const log = [
+      toolResultEntry('u-1', 'tool-1'),
+      unfinished,
+      toolResultEntry('u-2', 'tool-2'),
+      queuedEntry('q-2', 'u-2', 'human', 'prompt', 'stop', false, 's-2'),
+    ].join('\n');
+    const notes = await typedNotesByGrep(grepAccess({ '/log': log }, []), '/log');
+    expect(notes).toEqual(typedNotes(log));
+    expect(notes).toEqual([{ toolUseId: 'tool-2', prompt: 'stop' }]);
   });
 });
 
