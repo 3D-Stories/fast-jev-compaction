@@ -105,6 +105,11 @@ export interface CompactOptions {
   maxRequestTokens?: number;
   /** Characters of a dropped tool result to retain. Default 300. */
   truncateHeadChars?: number;
+  /**
+   * tool_use_ids of calls to keep whole, as the newest messages are: never
+   * asked about, dropped or truncated. Default none.
+   */
+  pinToolUseIds?: readonly string[];
 }
 
 export interface ResolvedCompactOptions {
@@ -114,6 +119,7 @@ export interface ResolvedCompactOptions {
   maxStateTokens: number;
   maxRequestTokens: number;
   truncateHeadChars: number;
+  pinToolUseIds: readonly string[];
 }
 
 export interface CompactResult {
