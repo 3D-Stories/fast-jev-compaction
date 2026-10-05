@@ -227,8 +227,10 @@ function isBoundary(entry: LogEntry): boolean {
  * reference. An earlier one was kept (and written again after the boundary),
  * put back as words, or summarized by that compaction. A boundary line that
  * does not parse is not seen, so notes before it count as held and their words
- * can come back twice: a copy is chosen over a loss (0 such lines in 871,988
- * measured on this host).
+ * can come back twice: a copy is chosen over a loss. On the grep path such a
+ * line, when it is the last match, turns protection off for that one
+ * compaction, since it cannot be told from a cut (0 lines that do not parse in
+ * 871,988 measured on this host).
  */
 function stillHeld(ordered: readonly LogEntry[]): LogEntry[] {
   const last = ordered.findLastIndex(isBoundary);
@@ -375,7 +377,7 @@ const PLAIN_ID = /^[A-Za-z0-9_-]+$/;
  * until every chain ends.
  */
 export async function typedNotesByGrep($: ProcessAccess, path: string): Promise<TypedNote[]> {
-  const notes = stillHeld(await grepEntries($, path, ['"queued_command"', '"compact_boundary"']));
+  const notes = stillHeld(await grepEntries($, path, ['"queued_command"', '"subtype":[ \t]*"compact_boundary"']));
   const entries = new Map<string, LogEntry>();
   const asked = new Set<string>();
   const plain = (uuid: string | null | undefined): uuid is string => !!uuid && PLAIN_ID.test(uuid);

@@ -290,6 +290,18 @@ describe('typedNotesByGrep', () => {
     }
   });
 
+  it('does not fetch a line that only holds the value "compact_boundary", so an unfinished one cannot stop the scan', async () => {
+    const unfinishedCall = logLine({
+      type: 'assistant',
+      uuid: 'a-9',
+      message: { content: [{ type: 'tool_use', id: 'tool-9', name: 'Grep', input: { value: 'compact_boundary' } }] },
+    }).slice(0, -3);
+    const log = [toolResultEntry('u-1', 'tool-1'), queuedEntry('q-1', 'u-1', 'human', 'prompt', 'stop', false, 's-1'), unfinishedCall].join('\n');
+    const notes = await typedNotesByGrep(grepAccess({ '/log': log }, []), '/log');
+    expect(notes).toEqual(typedNotes(log));
+    expect(notes).toEqual([{ toolUseId: 'tool-1', prompt: 'stop' }]);
+  });
+
   it('skips a line the log holds unfinished, as a whole read does, when grep printed lines after it', async () => {
     // A write that never finished leaves part of a line, and the next write joins it.
     const unfinished = boundaryLine().slice(0, 50) + queuedEntry('q-0', 'u-1', 'human', 'prompt', 'half written');
