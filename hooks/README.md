@@ -74,6 +74,16 @@ reduction, per-reason counts, state size and request count; a per-call
 compaction when `context.percent` reaches `compactAtPercent`, with an
 in-flight guard.
 
+A message typed while a tool runs reaches the model as a `queued_command`
+attachment on that tool's result message, not as message text, so a dropped
+or rebuilt result message would lose it. The hook reads the session log (a
+log over 4 MiB is scanned with `grep`) for messages a person typed (origin
+`human` or `bridge`) and, when the call one arrived with is dropped or cut,
+puts its words back as a plain user message,
+`[message typed while <tool> ran]: <text>`, where the call was. A result
+message the engine gets back unchanged keeps its attachment, so nothing is
+added for it. The call itself is scored like any other.
+
 ## Scope and caveat
 
 Function hooks are early access and may change between Claude Code releases.

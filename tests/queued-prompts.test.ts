@@ -1,12 +1,10 @@
 import { describe, expect, it } from 'vitest';
 import {
-  compactSession,
-  pinnedForQueuedPrompts,
   projectDirName,
-  queuedPromptToolUseIds,
-  queuedPromptToolUseIdsByGrep,
   register,
-  resolveHookConfig,
+  typedNotes,
+  typedNotesByGrep,
+  withTypedWords,
 } from '../hooks/fast-jev.ts';
 import type { Message } from '../src/index.js';
 
@@ -67,7 +65,7 @@ function queuedEntry(
   parentUuid: string,
   kind: string | undefined,
   mode = 'prompt',
-  prompt = 'note',
+  prompt: unknown = 'note',
   isMeta = false,
 ): string {
   return logLine({
@@ -88,10 +86,10 @@ function hookAttachment(uuid: string, parentUuid: string): string {
   return logLine({ type: 'attachment', uuid, parentUuid, attachment: { type: 'hook_success' } });
 }
 
-describe('queuedPromptToolUseIds', () => {
+describe('typedNotes', () => {
   it('finds the tool call whose result carries a message typed while it ran', () => {
     const log = [toolResultEntry('u-1', 'tool-1'), queuedEntry('q-1', 'u-1', 'human', 'prompt', 'send it to w74:p7F')].join('\n');
-    expect([...queuedPromptToolUseIds(log)]).toEqual(['tool-1']);
+    expect(typedNotes(log)).toEqual([{ toolUseId: 'tool-1', prompt: 'send it to w74:p7F' }]);
   });
 
   it('walks up through other attachments to the tool result', () => {
@@ -100,7 +98,7 @@ describe('queuedPromptToolUseIds', () => {
       logLine({ type: 'attachment', uuid: 'hook-1', parentUuid: 'u-1', attachment: { type: 'hook_success' } }),
       queuedEntry('q-1', 'hook-1', 'human'),
     ].join('\n');
-    expect([...queuedPromptToolUseIds(log)]).toEqual(['tool-1']);
+    expect(typedNotes(log)).toEqual([{ toolUseId: 'tool-1', prompt: 'note' }]);
   });
 
   it('ignores what the engine queues itself: task notifications, auto-continuations and observer digests', () => {
@@ -110,7 +108,7 @@ describe('queuedPromptToolUseIds', () => {
       queuedEntry('q-2', 'u-1', 'auto-continuation'),
       queuedEntry('q-3', 'u-1', 'observer-activity'),
     ].join('\n');
-    expect(queuedPromptToolUseIds(log).size).toBe(0);
+    expect(typedNotes(log)).toEqual([]);
   });
 
   it('finds nothing for a message delivered as its own turn, and skips lines it cannot parse', () => {
@@ -120,18 +118,18 @@ describe('queuedPromptToolUseIds', () => {
       '{not json',
       '',
     ].join('\n');
-    expect(queuedPromptToolUseIds(log).size).toBe(0);
+    expect(typedNotes(log)).toEqual([]);
   });
 
   it('walks any number of attachments up to the tool result', () => {
     const chain = Array.from({ length: 12 }, (_, i) => hookAttachment(`hook-${i}`, i === 0 ? 'u-1' : `hook-${i - 1}`));
     const log = [toolResultEntry('u-1', 'tool-1'), ...chain, queuedEntry('q-1', 'hook-11', 'human')].join('\n');
-    expect([...queuedPromptToolUseIds(log)]).toEqual(['tool-1']);
+    expect(typedNotes(log)).toEqual([{ toolUseId: 'tool-1', prompt: 'note' }]);
   });
 
   it('stops on a parent cycle without pinning anything', () => {
     const log = [hookAttachment('hook-a', 'hook-b'), hookAttachment('hook-b', 'hook-a'), queuedEntry('q-1', 'hook-a', 'human')].join('\n');
-    expect(queuedPromptToolUseIds(log).size).toBe(0);
+    expect(typedNotes(log)).toEqual([]);
   });
 
   it('counts only a person: the terminal (human), Remote Control (bridge), or an unmarked prompt with no origin', () => {
@@ -147,12 +145,35 @@ describe('queuedPromptToolUseIds', () => {
     ];
     for (const [kind, isMeta, counted] of kinds) {
       const log = [toolResultEntry('u-1', 'tool-1'), queuedEntry('q-1', 'u-1', kind, 'prompt', 'n', isMeta)].join('\n');
-      expect([kind, isMeta, queuedPromptToolUseIds(log).size]).toEqual([kind, isMeta, counted ? 1 : 0]);
+      expect([kind, isMeta, typedNotes(log).length]).toEqual([kind, isMeta, counted ? 1 : 0]);
     }
+  });
+
+  it('keeps the words of a prompt sent with an image, and says the image is not kept', () => {
+    const prompt = [
+      { type: 'text', text: 'why duplicates? [Image #2]' },
+      { type: 'image', source: { type: 'base64', media_type: 'image/png', data: 'iVBOR' } },
+    ];
+    const log = [toolResultEntry('u-1', 'tool-1'), queuedEntry('q-1', 'u-1', 'human', 'prompt', prompt)].join('\n');
+    expect(typedNotes(log)).toEqual([{ toolUseId: 'tool-1', prompt: 'why duplicates? [Image #2] [1 image not kept]' }]);
+  });
+
+  it('names a prompt once when the log holds a copy of it written after a compaction', () => {
+    const log = [
+      toolResultEntry('u-1', 'tool-1'),
+      queuedEntry('q-1', 'u-1', 'human', 'prompt', 'stop after the tests'),
+      queuedEntry('q-2', 'u-1', 'human', 'prompt', 'stop after the tests'),
+    ].join('\n');
+    expect(typedNotes(log)).toEqual([{ toolUseId: 'tool-1', prompt: 'stop after the tests' }]);
+  });
+
+  it('skips a typed message with no words', () => {
+    const log = [toolResultEntry('u-1', 'tool-1'), queuedEntry('q-1', 'u-1', 'human', 'prompt', '  ')].join('\n');
+    expect(typedNotes(log)).toEqual([]);
   });
 });
 
-describe('queuedPromptToolUseIdsByGrep', () => {
+describe('typedNotesByGrep', () => {
   function grepAccess(files: Record<string, string>, runs: (readonly string[])[]) {
     return { process: { run: async (argv: readonly string[]) => (runs.push(argv), fakeGrep(files, argv)) } };
   }
@@ -163,8 +184,8 @@ describe('queuedPromptToolUseIdsByGrep', () => {
       lines.push(toolResultEntry(`u-${i}`, `tool-${i}`), queuedEntry(`q-${i}`, `u-${i}`, 'human'));
     }
     const runs: (readonly string[])[] = [];
-    const ids = await queuedPromptToolUseIdsByGrep(grepAccess({ '/log': lines.join('\n') }, runs), '/log');
-    expect(ids.size).toBe(250);
+    const notes = await typedNotesByGrep(grepAccess({ '/log': lines.join('\n') }, runs), '/log');
+    expect(notes.length).toBe(250);
     const patternCounts = runs.filter((argv) => !argv.includes('-c')).map((argv) => argv.filter((a) => a === '-e').length);
     expect(patternCounts).toEqual([1, 200, 50]);
   });
@@ -172,25 +193,26 @@ describe('queuedPromptToolUseIdsByGrep', () => {
   it('never puts an id with pattern characters into a grep pattern', async () => {
     const lines = [toolResultEntry('a.b', 'tool-1'), queuedEntry('q-1', 'a.b', 'human')];
     const runs: (readonly string[])[] = [];
-    const ids = await queuedPromptToolUseIdsByGrep(grepAccess({ '/log': lines.join('\n') }, runs), '/log');
-    expect(ids.size).toBe(0);
+    const notes = await typedNotesByGrep(grepAccess({ '/log': lines.join('\n') }, runs), '/log');
+    expect(notes).toEqual([]);
     expect(runs.some((argv) => argv.some((a) => a.includes('a.b')))).toBe(false);
   });
-});
 
-describe('pinnedForQueuedPrompts', () => {
-  it('names every call answered in the message that carries the typed message', () => {
-    const messages = [
-      call('tool-1', 'Bash', 'a'),
-      message('user', '', {
-        toolResults: [
-          { tool_use_id: 'tool-1', text: 'a', isError: false },
-          { tool_use_id: 'tool-9', text: 'b', isError: false },
-        ],
-      }),
-      result('tool-2', 'c'),
-    ];
-    expect(pinnedForQueuedPrompts(messages, new Set(['tool-1']))).toEqual(['tool-1', 'tool-9']);
+  it('gives the same notes and words as reading the log whole', async () => {
+    const log = [
+      toolResultEntry('u-1', 'tool-1'),
+      hookAttachment('hook-0', 'u-1'),
+      queuedEntry('q-1', 'hook-0', 'human', 'prompt', 'use the staging key'),
+      toolResultEntry('u-2', 'tool-2'),
+      queuedEntry('q-2', 'u-2', 'task-notification', 'task-notification', 'background job done'),
+      queuedEntry('q-3', 'u-2', 'bridge', 'prompt', [{ type: 'text', text: 'from my phone' }]),
+    ].join('\n');
+    const notes = await typedNotesByGrep(grepAccess({ '/log': log }, []), '/log');
+    expect(notes).toEqual(typedNotes(log));
+    expect(notes).toEqual([
+      { toolUseId: 'tool-1', prompt: 'use the staging key' },
+      { toolUseId: 'tool-2', prompt: 'from my phone' },
+    ]);
   });
 });
 
@@ -203,12 +225,74 @@ describe('projectDirName', () => {
   });
 });
 
-describe('compactSession with pinToolUseIds', () => {
-  it('keeps a named call and its result as the engine objects, handles included, even when Jev would drop it', async () => {
-    const config = { ...resolveHookConfig({ preserveRecentMessages: 1 }), apiKey: 'k', pinToolUseIds: ['tool-1'] };
-    const { result: output, messages } = await compactSession(transcript(), config, jevFetch(0.05));
-    expect(messages.map((m) => m.handle)).toEqual(['h-0', 'h-tool-1', 'r-tool-1', 'h-5', 'h-6']);
-    expect(output.decisions.map((d) => d.reason)).toEqual(['pinned', 'call_dropped']);
+describe('withTypedWords', () => {
+  const words = '[message typed while Bash ran]: stop after the tests';
+  const note = { toolUseId: 'tool-1', prompt: 'stop after the tests' };
+
+  it('puts the words back where the dropped call was, once', () => {
+    const input = transcript();
+    const output = [input[0]!, input[5]!, input[6]!];
+    const { messages, added } = withTypedWords(input, output, [note]);
+    expect(added).toBe(1);
+    expect(messages.map((m) => m.text)).toEqual(['Run the slow check, then the tests.', words, 'Both ran.', 'go on']);
+    expect(messages[1]).toEqual({ role: 'user', text: words, toolUses: [] });
+    expect(messages.filter((m) => m.text === words)).toHaveLength(1);
+  });
+
+  it('adds nothing when the call came back as the engine message, which keeps its attachment', () => {
+    const input = transcript();
+    const { messages, added } = withTypedWords(input, input, [note]);
+    expect(added).toBe(0);
+    expect(messages).toEqual(input);
+  });
+
+  it('adds the words when the call came back rebuilt, without its handle', () => {
+    const input = transcript();
+    const rebuiltCall = { role: 'assistant' as const, text: '', toolUses: [{ tool_use_id: 'tool-1', tool: 'Bash', input: { command: 'tool-1' }, text: 'cut' }] };
+    const rebuiltResult = { role: 'user' as const, text: '', toolUses: [], toolResults: [{ tool_use_id: 'tool-1', text: 'cut', isError: false }] };
+    const output = [input[0]!, rebuiltCall, rebuiltResult, input[5]!, input[6]!];
+    const { messages } = withTypedWords(input, output, [note]);
+    expect(messages.map((m) => m.text)).toEqual(['Run the slow check, then the tests.', '', '', words, 'Both ran.', 'go on']);
+  });
+
+  it('does not add the words twice when an earlier compaction already put them back', () => {
+    const input = transcript();
+    const output = [input[0]!, { role: 'user' as const, text: words, toolUses: [] }, input[5]!, input[6]!];
+    const { messages, added } = withTypedWords(input, output, [note]);
+    expect(added).toBe(0);
+    expect(messages.filter((m) => m.text === words)).toHaveLength(1);
+  });
+
+  it('puts the words after every result of that turn, never between a call and its result', () => {
+    const input = [
+      message('user', 'check both', { handle: 'h-0' }),
+      call('tool-1', 'Bash', 'a'),
+      call('tool-2', 'Read', 'b'),
+      result('tool-1', 'a'),
+      result('tool-2', 'b'),
+      call('tool-3', 'Bash', 'c'.repeat(500)),
+      result('tool-3', 'c'.repeat(500)),
+      message('assistant', 'done', { handle: 'h-7' }),
+    ];
+    const cutCall = { role: 'assistant' as const, text: '', toolUses: [{ tool_use_id: 'tool-3', tool: 'Bash', input: { command: 'tool-3' }, text: 'c' }] };
+    const cutResult = { role: 'user' as const, text: '', toolUses: [], toolResults: [{ tool_use_id: 'tool-3', text: 'c', isError: false }] };
+    const kept = [input[0]!, input[2]!, input[4]!, cutCall, cutResult, input[7]!];
+    const { messages } = withTypedWords(input, [input[0]!, input[2]!, input[4]!, cutCall, cutResult, input[7]!], [note]);
+    const at = messages.findIndex((m) => m.text === words);
+    expect(messages.slice(0, at)).toEqual(kept.slice(0, 3));
+    expect(messages.slice(at + 1)).toEqual(kept.slice(3));
+  });
+
+  it('puts the words at the end when nothing after the call was kept', () => {
+    const input = transcript();
+    const { messages } = withTypedWords(input, [input[0]!], [note]);
+    expect(messages.map((m) => m.text)).toEqual(['Run the slow check, then the tests.', words]);
+  });
+
+  it('skips a typed message whose call is not in this compaction', () => {
+    const input = transcript();
+    const { added } = withTypedWords(input, [input[0]!], [{ toolUseId: 'tool-9', prompt: 'old' }]);
+    expect(added).toBe(0);
   });
 });
 
@@ -290,13 +374,13 @@ describe('the session.compact hook', () => {
   const logPath = '/home/u/.claude/projects/-home-u-proj/sess-1.jsonl';
   const log = [toolResultEntry('u-1', 'tool-1'), queuedEntry('q-1', 'u-1', 'human', 'prompt', 'do not merge #244')].join('\n');
 
-  it('keeps the call whose result carries a typed message, read from the session log', async () => {
+  it('keeps the words of a message typed while a dropped call ran, read from the session log', async () => {
     const { handler, fake, logs } = hookHarness({ [logPath]: log });
     const out = (await handler(fake, { trigger: 'auto', messages: transcript() }, async () => ({ skip: 'next' }))) as {
       messages: SessionMessage[];
     };
-    expect(out.messages.map((m) => m.handle)).toEqual(['h-0', 'h-tool-1', 'r-tool-1', 'h-5', 'h-6']);
-    expect(logs.some((line) => line.includes('1 tool call(s) that carry a message typed while they ran'))).toBe(true);
+    expect(out.messages.map((m) => [m.handle, m.text])).toEqual([['h-0', 'Run the slow check, then the tests.'], [undefined, '[message typed while Bash ran]: do not merge #244'], ['h-5', 'Both ran.'], ['h-6', 'go on']]);
+    expect(logs.some((line) => line.includes('kept 1 typed message(s) as text'))).toBe(true);
   });
 
   it('compacts as before when the session log cannot be read', async () => {
@@ -313,11 +397,11 @@ describe('the session.compact hook', () => {
     const out = (await handler(fake, { trigger: 'auto', messages: transcript() }, async () => ({ skip: 'next' }))) as {
       messages: SessionMessage[];
     };
-    expect(out.messages.map((m) => m.handle)).toEqual(['h-0', 'h-tool-1', 'r-tool-1', 'h-5', 'h-6']);
+    expect(out.messages.map((m) => [m.handle, m.text])).toEqual([['h-0', 'Run the slow check, then the tests.'], [undefined, '[message typed while Bash ran]: do not merge #244'], ['h-5', 'Both ran.'], ['h-6', 'go on']]);
     expect(reads).not.toContain(logPath);
     expect(runs.length).toBeGreaterThan(0);
     expect(runs.every((argv) => argv[0] === 'grep' && argv.at(-1) === logPath)).toBe(true);
-    expect(logs.some((line) => line.includes('1 tool call(s) that carry a message typed while they ran'))).toBe(true);
+    expect(logs.some((line) => line.includes('kept 1 typed message(s) as text'))).toBe(true);
   });
 
   it('follows a chain of attachments when it scans a large log with grep', async () => {
@@ -326,7 +410,7 @@ describe('the session.compact hook', () => {
     const out = (await handler(fake, { trigger: 'auto', messages: transcript() }, async () => ({ skip: 'next' }))) as {
       messages: SessionMessage[];
     };
-    expect(out.messages.map((m) => m.handle)).toEqual(['h-0', 'h-tool-1', 'r-tool-1', 'h-5', 'h-6']);
+    expect(out.messages.map((m) => [m.handle, m.text])).toEqual([['h-0', 'Run the slow check, then the tests.'], [undefined, '[message typed while Bash ran]: note'], ['h-5', 'Both ran.'], ['h-6', 'go on']]);
     expect(runs.filter((argv) => !argv.includes('-c')).length).toBe(4);
     expect(runs.filter((argv) => argv.includes('-c')).length).toBe(4);
   });
@@ -356,24 +440,17 @@ describe('the session.compact hook', () => {
     const out = (await handler(fake, { trigger: 'auto', messages: transcript() }, async () => ({ skip: 'next' }))) as {
       messages: SessionMessage[];
     };
-    expect(out.messages.map((m) => m.handle)).toEqual(['h-0', 'h-tool-1', 'r-tool-1', 'h-5', 'h-6']);
+    expect(out.messages.map((m) => [m.handle, m.text])).toEqual([['h-0', 'Run the slow check, then the tests.'], [undefined, '[message typed while Bash ran]: do not merge #244'], ['h-5', 'Both ran.'], ['h-6', 'go on']]);
     expect(logs.some((line) => line.includes('2 session logs named sess-1.jsonl'))).toBe(true);
   });
 
-  it('names the size of the kept calls when the reduction misses the minimum', async () => {
-    const big = [toolResultEntry('u-2', 'tool-2'), queuedEntry('q-2', 'u-2', 'human')].join('\n');
-    const { handler, fake, logs } = hookHarness({ [logPath]: big });
-    const out = await handler(fake, { trigger: 'auto', messages: transcript() }, async () => ({ skip: 'next' }));
-    expect(out).toEqual({ skip: 'next' });
-    expect(logs.some((line) => line.includes('fallback to built-in summary') && line.includes('kept for typed messages: 1 call(s), 400 chars'))).toBe(true);
-  });
-
-  it('names the kept calls on a fallback even when their output is empty', async () => {
+  it('falls back to the built-in summary without adding words when the reduction misses the minimum', async () => {
     const messages = [message('user', 'go', { handle: 'h-0' }), call('tool-1', 'Bash', ''), result('tool-1', '')];
     const { handler, fake, logs } = hookHarness({ [logPath]: log });
     const out = await handler(fake, { trigger: 'auto', messages }, async () => ({ skip: 'next' }));
     expect(out).toEqual({ skip: 'next' });
-    expect(logs.some((line) => line.includes('kept for typed messages: 1 call(s), 0 chars'))).toBe(true);
+    expect(logs.some((line) => line.includes('fallback to built-in summary'))).toBe(true);
+    expect(logs.some((line) => line.includes('typed message(s) as text'))).toBe(false);
   });
 
   it('does not trust grep output that was cut at the output limit', async () => {
@@ -420,7 +497,7 @@ describe('the session.compact hook', () => {
     const out = (await handler(fake, { trigger: 'auto', messages: transcript() }, async () => ({ skip: 'next' }))) as {
       messages: SessionMessage[];
     };
-    expect(out.messages.map((m) => m.handle)).toEqual(['h-0', 'h-tool-1', 'r-tool-1', 'h-5', 'h-6']);
+    expect(out.messages.map((m) => [m.handle, m.text])).toEqual([['h-0', 'Run the slow check, then the tests.'], [undefined, '[message typed while Bash ran]: note'], ['h-5', 'Both ran.'], ['h-6', 'go on']]);
   });
 
   it('does not trust grep output that holds fewer lines than grep -c counted', async () => {
@@ -464,7 +541,7 @@ describe('the session.compact hook', () => {
     const out = (await handler(fake, { trigger: 'auto', messages: transcript() }, async () => ({ skip: 'next' }))) as {
       messages: SessionMessage[];
     };
-    expect(out.messages.map((m) => m.handle)).toEqual(['h-0', 'h-tool-1', 'r-tool-1', 'h-5', 'h-6']);
+    expect(out.messages.map((m) => [m.handle, m.text])).toEqual([['h-0', 'Run the slow check, then the tests.'], [undefined, '[message typed while Bash ran]: do not merge #244'], ['h-5', 'Both ran.'], ['h-6', 'go on']]);
   });
 
   it('leaves a subagent compaction alone', async () => {
