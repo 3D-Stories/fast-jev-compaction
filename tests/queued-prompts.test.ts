@@ -61,13 +61,30 @@ function toolResultEntry(uuid: string, toolUseId: string): string {
   });
 }
 
-function queuedEntry(uuid: string, parentUuid: string, kind: string, mode = 'prompt', prompt = 'note'): string {
+function queuedEntry(
+  uuid: string,
+  parentUuid: string,
+  kind: string | undefined,
+  mode = 'prompt',
+  prompt = 'note',
+  isMeta = false,
+): string {
   return logLine({
     type: 'attachment',
     uuid,
     parentUuid,
-    attachment: { type: 'queued_command', prompt, commandMode: mode, origin: { kind } },
+    ...(isMeta ? { isMeta: true } : {}),
+    attachment: {
+      type: 'queued_command',
+      prompt,
+      commandMode: mode,
+      ...(kind === undefined ? {} : { origin: { kind } }),
+    },
   });
+}
+
+function hookAttachment(uuid: string, parentUuid: string): string {
+  return logLine({ type: 'attachment', uuid, parentUuid, attachment: { type: 'hook_success' } });
 }
 
 describe('queuedPromptToolUseIds', () => {
@@ -80,7 +97,7 @@ describe('queuedPromptToolUseIds', () => {
     const log = [
       toolResultEntry('u-1', 'tool-1'),
       logLine({ type: 'attachment', uuid: 'hook-1', parentUuid: 'u-1', attachment: { type: 'hook_success' } }),
-      queuedEntry('q-1', 'hook-1', 'peer'),
+      queuedEntry('q-1', 'hook-1', 'human'),
     ].join('\n');
     expect([...queuedPromptToolUseIds(log)]).toEqual(['tool-1']);
   });
@@ -103,6 +120,34 @@ describe('queuedPromptToolUseIds', () => {
       '',
     ].join('\n');
     expect(queuedPromptToolUseIds(log).size).toBe(0);
+  });
+
+  it('walks any number of attachments up to the tool result', () => {
+    const chain = Array.from({ length: 12 }, (_, i) => hookAttachment(`hook-${i}`, i === 0 ? 'u-1' : `hook-${i - 1}`));
+    const log = [toolResultEntry('u-1', 'tool-1'), ...chain, queuedEntry('q-1', 'hook-11', 'human')].join('\n');
+    expect([...queuedPromptToolUseIds(log)]).toEqual(['tool-1']);
+  });
+
+  it('stops on a parent cycle without pinning anything', () => {
+    const log = [hookAttachment('hook-a', 'hook-b'), hookAttachment('hook-b', 'hook-a'), queuedEntry('q-1', 'hook-a', 'human')].join('\n');
+    expect(queuedPromptToolUseIds(log).size).toBe(0);
+  });
+
+  it('counts only a person: the terminal (human), Remote Control (bridge), or an unmarked prompt with no origin', () => {
+    const kinds: Array<[string | undefined, boolean, boolean]> = [
+      ['human', false, true],
+      ['bridge', false, true],
+      [undefined, false, true],
+      [undefined, true, false],
+      ['peer', true, false],
+      ['peer', false, false],
+      ['scheduled-trigger', false, false],
+      ['auto-continuation', false, false],
+    ];
+    for (const [kind, isMeta, counted] of kinds) {
+      const log = [toolResultEntry('u-1', 'tool-1'), queuedEntry('q-1', 'u-1', kind, 'prompt', 'n', isMeta)].join('\n');
+      expect([kind, isMeta, queuedPromptToolUseIds(log).size]).toEqual([kind, isMeta, counted ? 1 : 0]);
+    }
   });
 });
 
@@ -142,7 +187,30 @@ describe('compactSession with pinToolUseIds', () => {
 
 type Handler = (fake: unknown, event: unknown, next: (e: unknown) => Promise<unknown>) => Promise<unknown>;
 
-function hookHarness(files: Record<string, string>, failRead = false) {
+type HarnessOptions = {
+  failRead?: boolean;
+  /** Reported sizes that override the text length, to stand for a log over 4 MiB. */
+  sizes?: Record<string, number>;
+  mtimes?: Record<string, number>;
+  /** Folders under ~/.claude/projects that the scan lists. */
+  dirs?: string[];
+  failProcess?: boolean;
+};
+
+/** grep -F -e P1 -e P2 … FILE, as the hook runs it: exit 0 with matches, 1 with none. */
+function fakeGrep(files: Record<string, string>, argv: readonly string[]) {
+  const patterns: string[] = [];
+  for (let i = 0; i < argv.length; i++) if (argv[i] === '-e') patterns.push(argv[++i]!);
+  const file = argv[argv.length - 1]!;
+  const lines = (files[file] ?? '').split('\n').filter((line) => patterns.some((p) => line.includes(p)));
+  return { exitCode: lines.length > 0 ? 0 : 1, stdout: lines.map((l) => `${l}\n`).join(''), stderr: '' };
+}
+
+function hookHarness(files: Record<string, string>, failReadOrOptions: boolean | HarnessOptions = false) {
+  const opts: HarnessOptions = typeof failReadOrOptions === 'boolean' ? { failRead: failReadOrOptions } : failReadOrOptions;
+  const failRead = opts.failRead ?? false;
+  const reads: string[] = [];
+  const runs: (readonly string[])[] = [];
   const handlers: Record<string, Handler> = {};
   const on = (name: string, a: unknown, b?: unknown) => {
     handlers[name] = (typeof a === 'function' ? a : b) as Handler;
@@ -159,14 +227,27 @@ function hookHarness(files: Record<string, string>, failRead = false) {
     fs: {
       exists: async (path: string) => path in files,
       read: async (path: string) => {
+        reads.push(path);
         if (failRead) throw new Error('read failed');
         if (!(path in files)) throw new Error(`missing ${path}`);
+        if ((opts.sizes?.[path] ?? 0) > 4 * 1024 * 1024) throw new Error('read over 4 MiB');
         return files[path]!;
       },
-      list: async () => [],
+      stat: async (path: string) => {
+        if (!(path in files)) throw new Error(`missing ${path}`);
+        return { kind: 'file', size: opts.sizes?.[path] ?? files[path]!.length, mtimeMs: opts.mtimes?.[path] ?? 0 };
+      },
+      list: async () => (opts.dirs ?? []).map((name) => ({ name, kind: 'dir' })),
+    },
+    process: {
+      run: async (argv: readonly string[]) => {
+        runs.push(argv);
+        if (opts.failProcess) throw new Error('grep not found');
+        return fakeGrep(files, argv);
+      },
     },
   };
-  return { handler: handlers['session.compact']!, fake, logs };
+  return { handler: handlers['session.compact']!, fake, logs, reads, runs };
 }
 
 describe('the session.compact hook', () => {
@@ -189,6 +270,65 @@ describe('the session.compact hook', () => {
     };
     expect(out.messages.map((m) => m.handle)).toEqual(['h-0', 'h-5', 'h-6']);
     expect(logs.some((line) => line.includes('could not read the session log'))).toBe(true);
+  });
+
+  it('scans a log over 4 MiB with grep instead of reading it whole', async () => {
+    const { handler, fake, logs, reads, runs } = hookHarness({ [logPath]: log }, { sizes: { [logPath]: 137_000_000 } });
+    const out = (await handler(fake, { trigger: 'auto', messages: transcript() }, async () => ({ skip: 'next' }))) as {
+      messages: SessionMessage[];
+    };
+    expect(out.messages.map((m) => m.handle)).toEqual(['h-0', 'h-tool-1', 'r-tool-1', 'h-5', 'h-6']);
+    expect(reads).not.toContain(logPath);
+    expect(runs.length).toBeGreaterThan(0);
+    expect(runs.every((argv) => argv[0] === 'grep' && argv.at(-1) === logPath)).toBe(true);
+    expect(logs.some((line) => line.includes('1 tool call(s) that carry a message typed while they ran'))).toBe(true);
+  });
+
+  it('follows a chain of attachments when it scans a large log with grep', async () => {
+    const chained = [toolResultEntry('u-1', 'tool-1'), hookAttachment('hook-0', 'u-1'), hookAttachment('hook-1', 'hook-0'), queuedEntry('q-1', 'hook-1', 'human')].join('\n');
+    const { handler, fake, runs } = hookHarness({ [logPath]: chained }, { sizes: { [logPath]: 137_000_000 } });
+    const out = (await handler(fake, { trigger: 'auto', messages: transcript() }, async () => ({ skip: 'next' }))) as {
+      messages: SessionMessage[];
+    };
+    expect(out.messages.map((m) => m.handle)).toEqual(['h-0', 'h-tool-1', 'r-tool-1', 'h-5', 'h-6']);
+    expect(runs.length).toBe(4);
+  });
+
+  it('says plainly that typed messages are not protected when a large log cannot be scanned', async () => {
+    const { handler, fake, logs } = hookHarness({ [logPath]: log }, { sizes: { [logPath]: 137_000_000 }, failProcess: true });
+    const out = (await handler(fake, { trigger: 'auto', messages: transcript() }, async () => ({ skip: 'next' }))) as {
+      messages: SessionMessage[];
+    };
+    expect(out.messages.map((m) => m.handle)).toEqual(['h-0', 'h-5', 'h-6']);
+    expect(logs.some((line) => line.includes('typed messages are not protected'))).toBe(true);
+  });
+
+  it('says plainly that typed messages are not protected when the session log is not found', async () => {
+    const { handler, fake, logs } = hookHarness({});
+    await handler(fake, { trigger: 'auto', messages: transcript() }, async () => ({ skip: 'next' }));
+    expect(logs.some((line) => line.includes('could not find the session log') && line.includes('not protected'))).toBe(true);
+  });
+
+  it('takes the newest of two same-named logs in other project folders, and says so', async () => {
+    const older = '/home/u/.claude/projects/-old/sess-1.jsonl';
+    const newer = '/home/u/.claude/projects/-new/sess-1.jsonl';
+    const { handler, fake, logs } = hookHarness(
+      { [older]: 'not a log', [newer]: log },
+      { dirs: ['-old', '-new'], mtimes: { [older]: 1, [newer]: 2 } },
+    );
+    const out = (await handler(fake, { trigger: 'auto', messages: transcript() }, async () => ({ skip: 'next' }))) as {
+      messages: SessionMessage[];
+    };
+    expect(out.messages.map((m) => m.handle)).toEqual(['h-0', 'h-tool-1', 'r-tool-1', 'h-5', 'h-6']);
+    expect(logs.some((line) => line.includes('2 session logs named sess-1.jsonl'))).toBe(true);
+  });
+
+  it('names the size of the kept calls when the reduction misses the minimum', async () => {
+    const big = [toolResultEntry('u-2', 'tool-2'), queuedEntry('q-2', 'u-2', 'human')].join('\n');
+    const { handler, fake, logs } = hookHarness({ [logPath]: big });
+    const out = await handler(fake, { trigger: 'auto', messages: transcript() }, async () => ({ skip: 'next' }));
+    expect(out).toEqual({ skip: 'next' });
+    expect(logs.some((line) => line.includes('fallback to built-in summary') && line.includes('kept for typed messages: 400 chars'))).toBe(true);
   });
 
   it('leaves a subagent compaction alone', async () => {
