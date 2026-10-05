@@ -67,6 +67,7 @@ function queuedEntry(
   mode = 'prompt',
   prompt: unknown = 'note',
   isMeta = false,
+  source?: string,
 ): string {
   return logLine({
     type: 'attachment',
@@ -78,7 +79,18 @@ function queuedEntry(
       prompt,
       commandMode: mode,
       ...(kind === undefined ? {} : { origin: { kind } }),
+      ...(source === undefined ? {} : { source_uuid: source }),
     },
+  });
+}
+
+function boundaryLine(preserved: string[] = []): string {
+  return logLine({
+    type: 'system',
+    subtype: 'compact_boundary',
+    uuid: `b-${preserved.length}`,
+    parentUuid: null,
+    compactMetadata: { trigger: 'auto', ...(preserved.length > 0 ? { preservedMessages: { uuids: preserved, allUuids: preserved } } : {}) },
   });
 }
 
@@ -158,13 +170,33 @@ describe('typedNotes', () => {
     expect(typedNotes(log)).toEqual([{ toolUseId: 'tool-1', prompt: 'why duplicates? [Image #2] [1 image not kept]' }]);
   });
 
-  it('names a prompt once when the log holds a copy of it written after a compaction', () => {
+  it('names a submission once when the log holds a copy of it', () => {
     const log = [
       toolResultEntry('u-1', 'tool-1'),
-      queuedEntry('q-1', 'u-1', 'human', 'prompt', 'stop after the tests'),
-      queuedEntry('q-2', 'u-1', 'human', 'prompt', 'stop after the tests'),
+      queuedEntry('q-1', 'u-1', 'human', 'prompt', 'stop after the tests', false, 's-1'),
+      queuedEntry('q-2', 'u-1', 'human', 'prompt', 'stop after the tests', false, 's-1'),
     ].join('\n');
     expect(typedNotes(log)).toEqual([{ toolUseId: 'tool-1', prompt: 'stop after the tests' }]);
+  });
+
+  it('keeps every submission, in order, even when two have the same words', () => {
+    const log = [
+      toolResultEntry('u-1', 'tool-1'),
+      queuedEntry('q-1', 'u-1', 'human', 'prompt', 'Use staging.', false, 's-1'),
+      queuedEntry('q-2', 'q-1', 'human', 'prompt', 'Use production.', false, 's-2'),
+      queuedEntry('q-3', 'q-2', 'human', 'prompt', 'Use staging.', false, 's-3'),
+    ].join('\n');
+    expect(typedNotes(log).map((note) => note.prompt)).toEqual(['Use staging.', 'Use production.', 'Use staging.']);
+  });
+
+  it('reads only the typed messages the session still holds: after its last compaction, or kept by it', () => {
+    const before = [toolResultEntry('u-1', 'tool-1'), queuedEntry('q-1', 'u-1', 'human', 'prompt', 'already handled', false, 's-1')];
+    const after = [toolResultEntry('u-2', 'tool-2'), queuedEntry('q-2', 'u-2', 'human', 'prompt', 'still held', false, 's-2')];
+    expect(typedNotes([...before, boundaryLine(), ...after].join('\n')).map((n) => n.prompt)).toEqual(['still held']);
+    expect(typedNotes([...before, boundaryLine(['q-1']), ...after].join('\n')).map((n) => n.prompt)).toEqual([
+      'already handled',
+      'still held',
+    ]);
   });
 
   it('skips a typed message with no words', () => {
@@ -187,7 +219,8 @@ describe('typedNotesByGrep', () => {
     const notes = await typedNotesByGrep(grepAccess({ '/log': lines.join('\n') }, runs), '/log');
     expect(notes.length).toBe(250);
     const patternCounts = runs.filter((argv) => !argv.includes('-c')).map((argv) => argv.filter((a) => a === '-e').length);
-    expect(patternCounts).toEqual([1, 200, 50]);
+    // The first grep asks for typed messages and compaction boundaries; the parents come in batches of 200.
+    expect(patternCounts).toEqual([2, 200, 50]);
   });
 
   it('never puts an id with pattern characters into a grep pattern', async () => {
@@ -206,12 +239,15 @@ describe('typedNotesByGrep', () => {
       toolResultEntry('u-2', 'tool-2'),
       queuedEntry('q-2', 'u-2', 'task-notification', 'task-notification', 'background job done'),
       queuedEntry('q-3', 'u-2', 'bridge', 'prompt', [{ type: 'text', text: 'from my phone' }]),
+      boundaryLine(['q-3']),
+      toolResultEntry('u-4', 'tool-4'),
+      queuedEntry('q-4', 'u-4', 'human', 'prompt', 'use the staging key', false, 's-4'),
     ].join('\n');
     const notes = await typedNotesByGrep(grepAccess({ '/log': log }, []), '/log');
     expect(notes).toEqual(typedNotes(log));
     expect(notes).toEqual([
-      { toolUseId: 'tool-1', prompt: 'use the staging key' },
       { toolUseId: 'tool-2', prompt: 'from my phone' },
+      { toolUseId: 'tool-4', prompt: 'use the staging key' },
     ]);
   });
 });
@@ -255,12 +291,38 @@ describe('withTypedWords', () => {
     expect(messages.map((m) => m.text)).toEqual(['Run the slow check, then the tests.', '', '', words, 'Both ran.', 'go on']);
   });
 
-  it('does not add the words twice when an earlier compaction already put them back', () => {
+  it('puts back every note on one call in order, even when two have the same words', () => {
     const input = transcript();
-    const output = [input[0]!, { role: 'user' as const, text: words, toolUses: [] }, input[5]!, input[6]!];
-    const { messages, added } = withTypedWords(input, output, [note]);
-    expect(added).toBe(0);
-    expect(messages.filter((m) => m.text === words)).toHaveLength(1);
+    const notes = ['Use staging.', 'Use production.', 'Use staging.'].map((prompt) => ({ toolUseId: 'tool-1', prompt }));
+    const { messages, added } = withTypedWords(input, [input[0]!, input[5]!, input[6]!], notes);
+    expect(added).toBe(3);
+    expect(messages.map((m) => m.text)).toEqual([
+      'Run the slow check, then the tests.',
+      '[message typed while Bash ran]: Use staging.',
+      '[message typed while Bash ran]: Use production.',
+      '[message typed while Bash ran]: Use staging.',
+      'Both ran.',
+      'go on',
+    ]);
+  });
+
+  it('places the words before a kept message that lost its calls and came back as text only', () => {
+    const input = [
+      message('user', 'Run checks.', { handle: 'h-0' }),
+      call('c1', 'Bash', 'a'.repeat(1000)),
+      result('c1', 'a'.repeat(1000)),
+      message('assistant', 'I am stopping now.', { toolUses: [{ tool_use_id: 'c2', tool: 'Bash', input: {}, text: 'b' }], handle: 'h-3' }),
+      result('c2', 'b'.repeat(1000)),
+      message('assistant', 'Done.', { handle: 'h-5' }),
+    ];
+    const textOnly = { role: 'assistant' as const, text: 'I am stopping now.', toolUses: [] };
+    const { messages } = withTypedWords(input, [input[0]!, textOnly, input[5]!], [{ toolUseId: 'c1', prompt: 'Stop after the first check.' }]);
+    expect(messages.map((m) => m.text)).toEqual([
+      'Run checks.',
+      '[message typed while Bash ran]: Stop after the first check.',
+      'I am stopping now.',
+      'Done.',
+    ]);
   });
 
   it('puts the words after every result of that turn, never between a call and its result', () => {
@@ -281,6 +343,18 @@ describe('withTypedWords', () => {
     const at = messages.findIndex((m) => m.text === words);
     expect(messages.slice(0, at)).toEqual(kept.slice(0, 3));
     expect(messages.slice(at + 1)).toEqual(kept.slice(3));
+  });
+
+  it('does not mistake a dropped call for a kept message with no text and no calls', () => {
+    const input = [
+      message('user', 'Run checks.', { handle: 'h-0' }),
+      call('c1', 'Bash', 'a'.repeat(1000)),
+      result('c1', 'a'.repeat(1000)),
+      message('assistant', '', { handle: 'h-3' }),
+      message('assistant', 'Done.', { handle: 'h-4' }),
+    ];
+    const { messages } = withTypedWords(input, [input[0]!, input[3]!, input[4]!], [{ toolUseId: 'c1', prompt: 'stop' }]);
+    expect(messages).toEqual([input[0], { role: 'user', text: '[message typed while Bash ran]: stop', toolUses: [] }, input[3], input[4]]);
   });
 
   it('puts the words at the end when nothing after the call was kept', () => {
@@ -442,6 +516,16 @@ describe('the session.compact hook', () => {
     };
     expect(out.messages.map((m) => [m.handle, m.text])).toEqual([['h-0', 'Run the slow check, then the tests.'], [undefined, '[message typed while Bash ran]: do not merge #244'], ['h-5', 'Both ran.'], ['h-6', 'go on']]);
     expect(logs.some((line) => line.includes('2 session logs named sess-1.jsonl'))).toBe(true);
+  });
+
+  it('does not put words back again for a typed message an earlier compaction already handled', async () => {
+    const handled = [toolResultEntry('u-1', 'tool-1'), queuedEntry('q-1', 'u-1', 'human', 'prompt', 'do not merge #244', false, 's-1'), boundaryLine()].join('\n');
+    const { handler, fake, logs } = hookHarness({ [logPath]: handled });
+    const out = (await handler(fake, { trigger: 'auto', messages: transcript() }, async () => ({ skip: 'next' }))) as {
+      messages: SessionMessage[];
+    };
+    expect(out.messages.map((m) => m.handle)).toEqual(['h-0', 'h-5', 'h-6']);
+    expect(logs.some((line) => line.includes('typed message(s) as text'))).toBe(false);
   });
 
   it('falls back to the built-in summary without adding words when the reduction misses the minimum', async () => {

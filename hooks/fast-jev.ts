@@ -169,11 +169,21 @@ const FS_READ_LIMIT = 4 * 1024 * 1024;
 
 type LogEntry = {
   type?: string;
+  subtype?: string;
   uuid?: string;
   parentUuid?: string | null;
   isMeta?: boolean;
   message?: { content?: unknown };
-  attachment?: { type?: string; commandMode?: string; isMeta?: boolean; origin?: { kind?: string }; prompt?: unknown };
+  attachment?: {
+    type?: string;
+    commandMode?: string;
+    isMeta?: boolean;
+    origin?: { kind?: string };
+    prompt?: unknown;
+    source_uuid?: string;
+    delivery_id?: string;
+  };
+  compactMetadata?: { preservedMessages?: { allUuids?: unknown } };
 };
 
 /** A message a person typed while a tool ran, and the call whose result carried it. */
@@ -207,6 +217,23 @@ function typedByPerson(entry: LogEntry): boolean {
   return !(entry.isMeta || attachment.isMeta);
 }
 
+function isBoundary(entry: LogEntry): boolean {
+  return entry.type === 'system' && entry.subtype === 'compact_boundary';
+}
+
+/**
+ * The typed messages the session still holds, from log entries in file order:
+ * those written after its last compaction, and those that compaction kept by
+ * reference. An earlier one was kept (and written again after the boundary),
+ * put back as words, or summarized by that compaction.
+ */
+function stillHeld(ordered: readonly LogEntry[]): LogEntry[] {
+  const last = ordered.findLastIndex(isBoundary);
+  const kept = ordered[last]?.compactMetadata?.preservedMessages?.allUuids;
+  const keptIds = new Set(Array.isArray(kept) ? kept.filter((id): id is string => typeof id === 'string') : []);
+  return ordered.filter((entry, index) => typedByPerson(entry) && (index > last || (entry.uuid !== undefined && keptIds.has(entry.uuid))));
+}
+
 function parseLine(line: string): LogEntry | undefined {
   try {
     const value = JSON.parse(line) as unknown;
@@ -236,8 +263,9 @@ function promptText(prompt: unknown): string {
  * Follows each typed message's `parentUuid` chain, through other attachments, to
  * the tool result it rides on. There is no step limit: the walk ends at a tool
  * result, a missing parent, a message that is not an attachment, or a parent it
- * has already seen. A message with no words is skipped, and a copy of one already
- * found (Claude Code writes kept attachments again after a compaction) is named once.
+ * has already seen. A message with no words is skipped. A copy of a submission
+ * (same `source_uuid`, which Claude Code keeps when it writes an attachment
+ * again) is named once; two submissions with the same words are both kept.
  */
 function carrierNotes(notes: readonly LogEntry[], entries: ReadonlyMap<string, LogEntry>): TypedNote[] {
   const found: TypedNote[] = [];
@@ -253,7 +281,7 @@ function carrierNotes(notes: readonly LogEntry[], entries: ReadonlyMap<string, L
       if (!parent) break;
       const [toolUseId] = toolResultIds(parent);
       if (toolUseId !== undefined) {
-        const key = `${toolUseId}\n${prompt}`;
+        const key = note.attachment?.source_uuid ?? note.attachment?.delivery_id ?? note.uuid ?? `${toolUseId}\n${prompt}`;
         if (!named.has(key)) {
           named.add(key);
           found.push({ toolUseId, prompt });
@@ -276,15 +304,15 @@ function carrierNotes(notes: readonly LogEntry[], entries: ReadonlyMap<string, L
  */
 export function typedNotes(log: string): TypedNote[] {
   const entries = new Map<string, LogEntry>();
-  const notes: LogEntry[] = [];
+  const ordered: LogEntry[] = [];
   for (const line of log.split('\n')) {
-    if (!line.includes('"tool_result"') && !line.includes('"attachment"')) continue;
+    if (!line.includes('"tool_result"') && !line.includes('"attachment"') && !line.includes('"compact_boundary"')) continue;
     const entry = parseLine(line);
     if (!entry) continue;
     if (entry.uuid) entries.set(entry.uuid, entry);
-    if (typedByPerson(entry)) notes.push(entry);
+    if (typedByPerson(entry) || isBoundary(entry)) ordered.push(entry);
   }
-  return carrierNotes(notes, entries);
+  return carrierNotes(stillHeld(ordered), entries);
 }
 
 type ProcessAccess = {
@@ -344,7 +372,7 @@ const PLAIN_ID = /^[A-Za-z0-9_-]+$/;
  * until every chain ends.
  */
 export async function typedNotesByGrep($: ProcessAccess, path: string): Promise<TypedNote[]> {
-  const notes = (await grepEntries($, path, ['"queued_command"'])).filter(typedByPerson);
+  const notes = stillHeld(await grepEntries($, path, ['"queued_command"', '"subtype": ?"compact_boundary"']));
   const entries = new Map<string, LogEntry>();
   const asked = new Set<string>();
   const plain = (uuid: string | null | undefined): uuid is string => !!uuid && PLAIN_ID.test(uuid);
@@ -375,51 +403,38 @@ export function typedWords(tool: string, prompt: string): string {
  * Puts back, as a plain user message, each typed message whose carrier did not
  * come back as the engine's own object: a dropped or rebuilt tool-result message
  * loses its `queued_command` attachment. The words go where the carrier was,
- * after the last result of that turn (never between a call and its result), and
- * never twice. A carrier the engine gets back keeps its attachment, so its words
- * are not added.
+ * after the last result of that turn (never between a call and its result), one
+ * message per note, in order. A carrier the engine gets back keeps its
+ * attachment, so its words are not added. A note an earlier compaction already
+ * handled is not in `notes` (see `stillHeld`), so words are never put back twice.
  */
 export function withTypedWords(
   input: readonly SessionMessage[],
   output: readonly SessionMessage[],
   notes: readonly TypedNote[],
 ): { messages: SessionMessage[]; added: number } {
-  const returned = new Set(output);
-  const callAt = new Map<string, number>();
-  output.forEach((message, index) => {
-    for (const tool of message.toolUses) callAt.set(tool.tool_use_id, index);
-  });
-  const outputIndex = (message: SessionMessage): number | undefined => {
-    const own = output.indexOf(message);
-    if (own >= 0) return own;
-    for (const tool of message.toolUses) {
-      const index = callAt.get(tool.tool_use_id);
-      if (index !== undefined) return index;
-    }
-    return undefined;
-  };
-  const texts = new Set(output.map((message) => message.text));
+  const at = alignment(input, output);
   const before = new Map<number, SessionMessage[]>();
   let added = 0;
   for (const note of notes) {
     const carrier = input.findIndex((message) =>
       (message.toolResults ?? []).some((result) => result.tool_use_id === note.toolUseId),
     );
-    if (carrier < 0 || returned.has(input[carrier]!)) continue;
+    if (carrier < 0) continue;
+    const kept = at.get(carrier);
+    if (kept !== undefined && output[kept] === input[carrier]) continue;
     const tool = input.flatMap((message) => message.toolUses).find((use) => use.tool_use_id === note.toolUseId);
-    const text = typedWords(tool?.tool ?? 'a tool', note.prompt);
-    if (texts.has(text)) continue;
-    texts.add(text);
-    let at = output.length;
+    let index = output.length;
     for (let i = carrier + 1; i < input.length; i++) {
       if ((input[i]!.toolResults ?? []).length > 0) continue;
-      const index = outputIndex(input[i]!);
-      if (index !== undefined) {
-        at = index;
+      const found = at.get(i);
+      if (found !== undefined) {
+        index = found;
         break;
       }
     }
-    before.set(at, [...(before.get(at) ?? []), { role: 'user', text, toolUses: [] }]);
+    const words: SessionMessage = { role: 'user', text: typedWords(tool?.tool ?? 'a tool', note.prompt), toolUses: [] };
+    before.set(index, [...(before.get(index) ?? []), words]);
     added += 1;
   }
   if (added === 0) return { messages: [...output], added };
@@ -427,6 +442,38 @@ export function withTypedWords(
   output.forEach((message, index) => messages.push(...(before.get(index) ?? []), message));
   messages.push(...(before.get(output.length) ?? []));
   return { messages, added };
+}
+
+function toolIds(message: SessionMessage): string[] {
+  return [...message.toolUses.map((use) => use.tool_use_id), ...(message.toolResults ?? []).map((result) => result.tool_use_id)];
+}
+
+/**
+ * Where each input message ended up in the output, by index. The library keeps
+ * input order, so one pass pairs them: an output message is the next input
+ * message itself, or that message rebuilt (same role and text, holding only
+ * calls the input message held). A rebuilt message with no calls left has text,
+ * since one with neither is removed.
+ */
+function alignment(input: readonly SessionMessage[], output: readonly SessionMessage[]): Map<number, number> {
+  const at = new Map<number, number>();
+  let next = 0;
+  input.forEach((message, index) => {
+    const candidate = output[next];
+    if (!candidate) return;
+    const own = new Set(toolIds(message));
+    const theirs = toolIds(candidate);
+    const rebuilt =
+      candidate.role === message.role &&
+      candidate.text === message.text &&
+      theirs.every((id) => own.has(id)) &&
+      (theirs.length > 0 || candidate.text.trim() !== '');
+    if (candidate === message || rebuilt) {
+      at.set(index, next);
+      next += 1;
+    }
+  });
+  return at;
 }
 
 /** The folder name Claude Code gives a project's session logs. */
