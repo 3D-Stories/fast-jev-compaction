@@ -169,12 +169,25 @@ const FS_READ_LIMIT = 4 * 1024 * 1024;
 
 type LogEntry = {
   type?: string;
+  subtype?: string;
   uuid?: string;
   parentUuid?: string | null;
   isMeta?: boolean;
   message?: { content?: unknown };
-  attachment?: { type?: string; commandMode?: string; isMeta?: boolean; origin?: { kind?: string } };
+  attachment?: {
+    type?: string;
+    commandMode?: string;
+    isMeta?: boolean;
+    origin?: { kind?: string };
+    prompt?: unknown;
+    source_uuid?: string;
+    delivery_id?: string;
+  };
+  compactMetadata?: { preservedMessages?: { allUuids?: unknown } };
 };
+
+/** A message a person typed while a tool ran, and the call whose result carried it. */
+export type TypedNote = { toolUseId: string; prompt: string };
 
 function toolResultIds(entry: LogEntry): string[] {
   const content = entry.message?.content;
@@ -204,6 +217,33 @@ function typedByPerson(entry: LogEntry): boolean {
   return !(entry.isMeta || attachment.isMeta);
 }
 
+function isBoundary(entry: LogEntry): boolean {
+  return entry.type === 'system' && entry.subtype === 'compact_boundary';
+}
+
+/**
+ * The typed messages the session still holds, from log entries in file order:
+ * those written after its last compaction, and those that compaction kept by
+ * reference. An earlier one was kept (and written again after the boundary),
+ * put back as words, or summarized by that compaction. A boundary line that
+ * does not parse is not seen, so notes before it count as held and their words
+ * can come back twice: a copy is chosen over a loss. On the grep path a matched
+ * line that does not parse, while it is the last match, turns protection off,
+ * since it cannot be told from a cut. That lasts until a matching line that
+ * parses is written after it; a write appended to an unfinished line joins it,
+ * so it can last more than one compaction. The boundary pattern asks for
+ * `"subtype":` with no space before the colon, as Claude Code writes it, so a
+ * boundary spelled otherwise is missed and words can come back twice. 0 lines
+ * that do not parse in 871,988, and 192 of 192 boundaries written that way,
+ * measured on this host.
+ */
+function stillHeld(ordered: readonly LogEntry[]): LogEntry[] {
+  const last = ordered.findLastIndex(isBoundary);
+  const kept = ordered[last]?.compactMetadata?.preservedMessages?.allUuids;
+  const keptIds = new Set(Array.isArray(kept) ? kept.filter((id): id is string => typeof id === 'string') : []);
+  return ordered.filter((entry, index) => typedByPerson(entry) && (index > last || (entry.uuid !== undefined && keptIds.has(entry.uuid))));
+}
+
 function parseLine(line: string): LogEntry | undefined {
   try {
     const value = JSON.parse(line) as unknown;
@@ -214,50 +254,75 @@ function parseLine(line: string): LogEntry | undefined {
 }
 
 /**
+ * The words of a typed message. A prompt sent with an image is a list of blocks:
+ * its text blocks are kept, and each image is named as not kept.
+ */
+function promptText(prompt: unknown): string {
+  if (typeof prompt === 'string') return prompt;
+  if (!Array.isArray(prompt)) return '';
+  const blocks = prompt.filter((block): block is { type?: unknown; text?: unknown } => typeof block === 'object' && block !== null);
+  const text = blocks
+    .map((block) => (block.type === 'text' && typeof block.text === 'string' ? block.text : ''))
+    .filter(Boolean)
+    .join('\n');
+  const images = blocks.filter((block) => block.type === 'image').length;
+  return images > 0 ? `${text} [${images} image${images === 1 ? '' : 's'} not kept]` : text;
+}
+
+/**
  * Follows each typed message's `parentUuid` chain, through other attachments, to
  * the tool result it rides on. There is no step limit: the walk ends at a tool
  * result, a missing parent, a message that is not an attachment, or a parent it
- * has already seen.
+ * has already seen. A message with no words is skipped. A copy of a submission
+ * (same `source_uuid`, which Claude Code keeps when it writes an attachment
+ * again) is named once; two submissions with the same words are both kept.
  */
-function carrierIds(notes: readonly LogEntry[], entries: ReadonlyMap<string, LogEntry>): Set<string> {
-  const ids = new Set<string>();
+function carrierNotes(notes: readonly LogEntry[], entries: ReadonlyMap<string, LogEntry>): TypedNote[] {
+  const found: TypedNote[] = [];
+  const named = new Set<string>();
   for (const note of notes) {
+    const prompt = promptText(note.attachment?.prompt);
+    if (prompt.trim() === '') continue;
     const seen = new Set<string>();
     let uuid = note.parentUuid ?? undefined;
     while (uuid && !seen.has(uuid)) {
       seen.add(uuid);
       const parent = entries.get(uuid);
       if (!parent) break;
-      const found = toolResultIds(parent);
-      if (found.length > 0) {
-        for (const id of found) ids.add(id);
+      const [toolUseId] = toolResultIds(parent);
+      if (toolUseId !== undefined) {
+        const key = note.attachment?.source_uuid ?? note.attachment?.delivery_id ?? note.uuid ?? `${toolUseId}\n${prompt}`;
+        if (!named.has(key)) {
+          named.add(key);
+          found.push({ toolUseId, prompt });
+        }
         break;
       }
       if (parent.type !== 'attachment') break;
       uuid = parent.parentUuid ?? undefined;
     }
   }
-  return ids;
+  return found;
 }
 
 /**
- * The tool calls whose result carries a message someone typed while the tool
- * ran. Claude Code delivers such a message as a `queued_command` attachment on
- * the tool-result message, not in its text, so the session messages a hook sees
- * do not show it: dropping or rebuilding that message loses it. Reads the
- * session log (JSON lines) and returns those calls' tool_use_ids.
+ * The messages someone typed while a tool ran, each with the call whose result
+ * carried it. Claude Code delivers such a message as a `queued_command`
+ * attachment on the tool-result message, not in its text, so the session
+ * messages a hook sees do not show it: dropping or rebuilding that message loses
+ * it. Reads the session log (JSON lines).
  */
-export function queuedPromptToolUseIds(log: string): Set<string> {
+export function typedNotes(log: string): TypedNote[] {
   const entries = new Map<string, LogEntry>();
-  const notes: LogEntry[] = [];
+  const ordered: LogEntry[] = [];
   for (const line of log.split('\n')) {
-    if (!line.includes('"tool_result"') && !line.includes('"attachment"')) continue;
+    if (!line.includes('"tool_result"') && !line.includes('"attachment"') && !line.includes('"compact_boundary"')) continue;
     const entry = parseLine(line);
     if (!entry) continue;
     if (entry.uuid) entries.set(entry.uuid, entry);
-    if (typedByPerson(entry)) notes.push(entry);
+    if (typedByPerson(entry) || isBoundary(entry)) ordered.push(entry);
   }
-  return carrierIds(notes, entries);
+  return carrierNotes(stillHeld(ordered), entries);
 }
 
 type ProcessAccess = {
@@ -275,8 +340,8 @@ type ProcessAccess = {
  * partial answer. `grep -c` counts the matching lines first, and the full grep
  * must return at least that many: process output is cut at a limit, and a cut
  * at a line end would otherwise look complete. Exit 1 means no match only with
- * nothing printed; output that does not end in a newline, or a line that is not
- * JSON, was cut too.
+ * nothing printed; output that does not end in a newline, or whose last line is
+ * not JSON, was cut too.
  */
 async function grepEntries($: ProcessAccess, path: string, patterns: readonly string[]): Promise<LogEntry[]> {
   const entries: LogEntry[] = [];
@@ -295,15 +360,15 @@ async function grepEntries($: ProcessAccess, path: string, patterns: readonly st
       throw new Error(`grep exited ${exitCode}: ${stderr.trim().slice(0, 200)}`);
     }
     if (stdout !== '' && !stdout.endsWith('\n')) throw new Error('grep output was cut at the output limit');
-    let returned = 0;
-    for (const line of stdout.split('\n')) {
-      if (line === '') continue;
+    const lines = stdout.split('\n').slice(0, -1);
+    for (const [index, line] of lines.entries()) {
       const entry = parseLine(line);
-      if (!entry) throw new Error('grep printed a line that is not JSON');
-      entries.push(entry);
-      returned += 1;
+      // A cut removes only the end, so a line that is not JSON with lines after it
+      // is in the log itself (a write that never finished): skip it, as a whole read does.
+      if (!entry && index === lines.length - 1) throw new Error('grep printed a line that is not JSON');
+      if (entry) entries.push(entry);
     }
-    if (returned < expected) throw new Error(`grep returned ${returned} of ${expected} matching lines (output cut)`);
+    if (lines.length < expected) throw new Error(`grep returned ${lines.length} of ${expected} matching lines (output cut)`);
   }
   return entries;
 }
@@ -312,12 +377,12 @@ async function grepEntries($: ProcessAccess, path: string, patterns: readonly st
 const PLAIN_ID = /^[A-Za-z0-9_-]+$/;
 
 /**
- * The same answer as `queuedPromptToolUseIds`, for a log too large to read
- * whole: grep finds the typed messages, then fetches each step of their parent
- * chains by uuid until every chain ends.
+ * The same answer as `typedNotes`, for a log too large to read whole: grep finds
+ * the typed messages, then fetches each step of their parent chains by uuid
+ * until every chain ends.
  */
-export async function queuedPromptToolUseIdsByGrep($: ProcessAccess, path: string): Promise<Set<string>> {
-  const notes = (await grepEntries($, path, ['"queued_command"'])).filter(typedByPerson);
+export async function typedNotesByGrep($: ProcessAccess, path: string): Promise<TypedNote[]> {
+  const notes = stillHeld(await grepEntries($, path, ['"queued_command"', '"subtype":[ \t]*"compact_boundary"']));
   const entries = new Map<string, LogEntry>();
   const asked = new Set<string>();
   const plain = (uuid: string | null | undefined): uuid is string => !!uuid && PLAIN_ID.test(uuid);
@@ -336,34 +401,89 @@ export async function queuedPromptToolUseIdsByGrep($: ProcessAccess, path: strin
     }
     wanted = next;
   }
-  return carrierIds(notes, entries);
+  return carrierNotes(notes, entries);
+}
+
+/** The user message that keeps a typed message once the call it arrived with is gone. */
+export function typedWords(tool: string, prompt: string): string {
+  return `[message typed while ${tool} ran]: ${prompt}`;
 }
 
 /**
- * Every call answered in a message that carries a typed message, so that whole
- * message stays the engine's own object, attachment included.
+ * Puts back, as a plain user message, each typed message whose carrier did not
+ * come back as the engine's own object: a dropped or rebuilt tool-result message
+ * loses its `queued_command` attachment. The words go where the carrier was,
+ * after the last result of that turn (never between a call and its result), one
+ * message per note, in order. A carrier the engine gets back keeps its
+ * attachment, so its words are not added. A note an earlier compaction already
+ * handled is not in `notes` (see `stillHeld`), so words are never put back twice.
  */
-export function pinnedForQueuedPrompts(
-  messages: readonly SessionMessage[],
-  noted: ReadonlySet<string>,
-): string[] {
-  const pinned: string[] = [];
-  for (const message of messages) {
-    const results = message.toolResults ?? [];
-    if (!results.some((result) => noted.has(result.tool_use_id))) continue;
-    for (const result of results) pinned.push(result.tool_use_id);
+export function withTypedWords(
+  input: readonly SessionMessage[],
+  output: readonly SessionMessage[],
+  notes: readonly TypedNote[],
+): { messages: SessionMessage[]; added: number } {
+  const at = alignment(input, output);
+  const before = new Map<number, SessionMessage[]>();
+  let added = 0;
+  for (const note of notes) {
+    const carrier = input.findIndex((message) =>
+      (message.toolResults ?? []).some((result) => result.tool_use_id === note.toolUseId),
+    );
+    if (carrier < 0) continue;
+    const kept = at.get(carrier);
+    if (kept !== undefined && output[kept] === input[carrier]) continue;
+    const tool = input.flatMap((message) => message.toolUses).find((use) => use.tool_use_id === note.toolUseId);
+    let index = output.length;
+    for (let i = carrier + 1; i < input.length; i++) {
+      if ((input[i]!.toolResults ?? []).length > 0) continue;
+      const found = at.get(i);
+      if (found !== undefined) {
+        index = found;
+        break;
+      }
+    }
+    const words: SessionMessage = { role: 'user', text: typedWords(tool?.tool ?? 'a tool', note.prompt), toolUses: [] };
+    before.set(index, [...(before.get(index) ?? []), words]);
+    added += 1;
   }
-  return pinned;
+  if (added === 0) return { messages: [...output], added };
+  const messages: SessionMessage[] = [];
+  output.forEach((message, index) => messages.push(...(before.get(index) ?? []), message));
+  messages.push(...(before.get(output.length) ?? []));
+  return { messages, added };
 }
 
-/** Characters of tool output the named calls hold. */
-function resultChars(messages: readonly SessionMessage[], ids: readonly string[]): number {
-  const named = new Set(ids);
-  let chars = 0;
-  for (const message of messages) {
-    for (const result of message.toolResults ?? []) if (named.has(result.tool_use_id)) chars += result.text.length;
-  }
-  return chars;
+function toolIds(message: SessionMessage): string[] {
+  return [...message.toolUses.map((use) => use.tool_use_id), ...(message.toolResults ?? []).map((result) => result.tool_use_id)];
+}
+
+/**
+ * Where each input message ended up in the output, by index. The library keeps
+ * input order, so one pass pairs them: an output message is the next input
+ * message itself, or that message rebuilt (same role and text, holding only
+ * calls the input message held). A rebuilt message with no calls left has text,
+ * since one with neither is removed.
+ */
+function alignment(input: readonly SessionMessage[], output: readonly SessionMessage[]): Map<number, number> {
+  const at = new Map<number, number>();
+  let next = 0;
+  input.forEach((message, index) => {
+    const candidate = output[next];
+    if (!candidate) return;
+    const own = new Set(toolIds(message));
+    const theirs = toolIds(candidate);
+    const rebuilt =
+      candidate.role === message.role &&
+      candidate.text === message.text &&
+      theirs.every((id) => own.has(id)) &&
+      (theirs.length > 0 || candidate.text.trim() !== '');
+    if (candidate === message || rebuilt) {
+      at.set(index, next);
+      next += 1;
+    }
+  });
+  return at;
 }
 
 /** The folder name Claude Code gives a project's session logs. */
@@ -412,19 +532,17 @@ async function locateSessionLog($: SessionLogAccess): Promise<{ path?: string; n
 }
 
 /**
- * The calls in this session's log that carry a typed message. A log up to 4 MiB
- * is read whole; a larger one is scanned with grep. `problem` says why nothing
- * could be found.
+ * The typed messages in this session's log. A log up to 4 MiB is read whole; a
+ * larger one is scanned with grep. `problem` says why nothing could be found.
  */
-async function typedMessageCarriers(
+async function typedMessagesInLog(
   $: SessionLogAccess,
-): Promise<{ ids?: Set<string>; problem?: string; note?: string }> {
+): Promise<{ notes?: TypedNote[]; problem?: string; note?: string }> {
   const { path, note } = await locateSessionLog($);
   if (!path) return { problem: 'could not find the session log' };
   const { size } = await $.fs.stat(path);
-  const ids =
-    size <= FS_READ_LIMIT ? queuedPromptToolUseIds(await $.fs.read(path)) : await queuedPromptToolUseIdsByGrep($, path);
-  return { ids, note };
+  const notes = size <= FS_READ_LIMIT ? typedNotes(await $.fs.read(path)) : await typedNotesByGrep($, path);
+  return { notes, note };
 }
 
 export type SessionCompaction = {
@@ -534,23 +652,13 @@ export const register: Register = (on: On, options: PluginOptions) => {
   on('session.compact', async ($, event, next) => {
     try {
       const config: HookConfig = { ...configured, apiKey: await getApiKey($, configured) };
-      let typedPins = 0;
-      let typedChars = 0;
+      let typed: TypedNote[] = [];
       if (!event.agentId) {
         try {
-          const { ids, problem, note } = await typedMessageCarriers($);
+          const { notes, problem, note } = await typedMessagesInLog($);
           if (note) $.ui.log(note);
-          if (!ids) {
-            $.ui.log(`${problem}; typed messages are not protected in this compaction`);
-          } else {
-            const pinned = pinnedForQueuedPrompts(event.messages, ids);
-            if (pinned.length > 0) {
-              config.pinToolUseIds = pinned;
-              typedPins = pinned.length;
-              typedChars = resultChars(event.messages, pinned);
-              $.ui.log(`keeping ${pinned.length} tool call(s) that carry a message typed while they ran`);
-            }
-          }
+          if (!notes) $.ui.log(`${problem}; typed messages are not protected in this compaction`);
+          else typed = notes;
         } catch (error) {
           $.ui.log(
             `could not read the session log (${error instanceof Error ? error.message : String(error)}); typed messages are not protected in this compaction`,
@@ -565,17 +673,17 @@ export const register: Register = (on: On, options: PluginOptions) => {
       if (reductionRatio(result) < config.minReductionRatio) {
         notify(
           $,
-          `fallback to built-in summary (below ${percent(config.minReductionRatio)} minimum: ${summarize(result)}${
-            typedPins > 0 ? `; kept for typed messages: ${typedPins} call(s), ${typedChars} chars` : ''
-          })`,
+          `fallback to built-in summary (below ${percent(config.minReductionRatio)} minimum: ${summarize(result)})`,
         );
         return next(event);
       }
+      const words = withTypedWords(event.messages, messages, typed);
+      if (words.added > 0) $.ui.log(`kept ${words.added} typed message(s) as text: the call each arrived with was dropped or cut`);
       notify(
         $,
-        `kept ${messages.length}/${event.messages.length} messages, no summary (${summarize(result)})`,
+        `kept ${words.messages.length}/${event.messages.length} messages, no summary (${summarize(result)})`,
       );
-      return { messages };
+      return { messages: words.messages };
     } catch (error) {
       notify(
         $,
