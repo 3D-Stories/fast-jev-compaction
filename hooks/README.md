@@ -74,6 +74,16 @@ reduction, per-reason counts, state size and request count; a per-call
 compaction when `context.percent` reaches `compactAtPercent`, with an
 in-flight guard.
 
+Every compaction, a subagent's included, first logs one `input:` line, before
+the session log is read or Jev is asked. It says what the hook was handed:
+how many messages (user and assistant), and their characters as the reduction
+counts them, split into user text (and, inside it, how many user messages
+without tool calls or results start with `Stop hook feedback:`, any
+whitespace and `[`, and how long they are), assistant text, tool input and
+tool output. It also gives the characters of the result text each tool
+use mirrors, which the reduction does not count. The line carries counts
+only, never any message text.
+
 A message typed while a tool runs reaches the model as a `queued_command`
 attachment on that tool's result message, not as message text, so a dropped
 or rebuilt result message would lose it. The hook reads the session log (a

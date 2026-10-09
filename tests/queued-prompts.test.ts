@@ -702,4 +702,33 @@ describe('the session.compact hook', () => {
     )) as { messages: SessionMessage[] };
     expect(out.messages.map((m) => m.handle)).toEqual(['h-0', 'h-5', 'h-6']);
   });
+
+  it('logs the input counts first, before it reads the session log or asks Jev, in a subagent too', async () => {
+    const feedback = (): SessionMessage[] => [
+      message('user', 'Stop hook feedback:\n[goal text]: Not satisfied. reason'),
+      message('user', 'Fix the failing test.'),
+      message('assistant', 'Running the tests.', {
+        toolUses: [{ tool_use_id: 'tool-1', tool: 'Bash', input: { command: 'npm test' }, text: 'FAIL b.test.ts' }],
+      }),
+      message('user', '', { toolResults: [{ tool_use_id: 'tool-1', text: 'FAIL b.test.ts: expected 2 to be 3', isError: true }] }),
+      message('assistant', 'Fixing now.'),
+    ];
+    for (const agentId of [undefined, 'agent-1']) {
+      const { handler, fake, logs, reads } = hookHarness({ [logPath]: log });
+      let asked = 0;
+      const seen: { reads: number; asked: number }[] = [];
+      const watched = {
+        ...fake,
+        http: { fetch: async (url: string, init?: { body?: string }) => ((asked += 1), fake.http.fetch(url, init)) },
+        ui: { ...fake.ui, log: (text: string) => (seen.push({ reads: reads.length, asked }), fake.ui.log(text)) },
+      };
+      await handler(watched, { trigger: 'auto', agentId, messages: feedback() }, async () => ({ skip: 'next' }));
+      expect(logs[0]).toBe(
+        'input: 5 messages (3 user, 2 assistant), 160 chars: user text 75 (1 Stop hook feedback copies, 54 chars), assistant text 29, tool input 22, tool output 34; tool-use mirrors 14 chars, not counted',
+      );
+      expect(seen[0]).toEqual({ reads: 0, asked: 0 });
+      expect(asked).toBeGreaterThan(0);
+      expect(logs.filter((line) => line.startsWith('input: '))).toHaveLength(1);
+    }
+  });
 });

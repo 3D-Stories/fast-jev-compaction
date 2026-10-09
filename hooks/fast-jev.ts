@@ -8,7 +8,8 @@ import type {
   TurnCompleteInput,
 } from 'claude-code';
 
-import { compact, reductionRatio, resolveOptions } from '../src/compact.js';
+import { compact, messageChars, reductionRatio, resolveOptions } from '../src/compact.js';
+import { isStopHookFeedback } from '../src/feedback.js';
 import { buildJevRequest, DEFAULT_MODEL, parseJevResponse } from '../src/request.js';
 import type {
   CompactOptions,
@@ -561,6 +562,71 @@ export async function compactSession(
   return { result, messages: toSessionMessages(messages, result.messages) };
 }
 
+/** What a compaction was handed, in counts only: never any message text. */
+export type InputBreakdown = {
+  messages: number;
+  userMessages: number;
+  assistantMessages: number;
+  /** The sum of `messageChars`, the measure the reduction ratio uses. */
+  chars: number;
+  userText: number;
+  /** Stop hook feedback copies, counted inside `userText`. */
+  feedbackCopies: number;
+  feedbackChars: number;
+  assistantText: number;
+  toolInput: number;
+  toolOutput: number;
+  /** The `text` each tool use mirrors from its result, which `messageChars` leaves out. */
+  toolUseMirrors: number;
+};
+
+/**
+ * The messages a compaction was handed, counted by kind. User text, assistant
+ * text, tool input and tool output add up to `chars`: tool input is what
+ * `messageChars` counts beyond the text and the tool output, so it is counted
+ * exactly as the reduction counts it.
+ */
+export function inputBreakdown(messages: readonly Message[]): InputBreakdown {
+  const counts: InputBreakdown = {
+    messages: messages.length,
+    userMessages: 0,
+    assistantMessages: 0,
+    chars: 0,
+    userText: 0,
+    feedbackCopies: 0,
+    feedbackChars: 0,
+    assistantText: 0,
+    toolInput: 0,
+    toolOutput: 0,
+    toolUseMirrors: 0,
+  };
+  for (const message of messages) {
+    const chars = messageChars(message);
+    const output = (message.toolResults ?? []).reduce((sum, result) => sum + result.text.length, 0);
+    counts.chars += chars;
+    counts.toolOutput += output;
+    counts.toolInput += chars - message.text.length - output;
+    for (const tool of message.toolUses) counts.toolUseMirrors += tool.text?.length ?? 0;
+    if (message.role === 'user') {
+      counts.userMessages += 1;
+      counts.userText += message.text.length;
+      if (isStopHookFeedback(message)) {
+        counts.feedbackCopies += 1;
+        counts.feedbackChars += message.text.length;
+      }
+    } else {
+      counts.assistantMessages += 1;
+      counts.assistantText += message.text.length;
+    }
+  }
+  return counts;
+}
+
+/** The first line a compaction logs: what it was handed, as counts. */
+export function inputLine(b: InputBreakdown): string {
+  return `input: ${b.messages} messages (${b.userMessages} user, ${b.assistantMessages} assistant), ${b.chars} chars: user text ${b.userText} (${b.feedbackCopies} Stop hook feedback copies, ${b.feedbackChars} chars), assistant text ${b.assistantText}, tool input ${b.toolInput}, tool output ${b.toolOutput}; tool-use mirrors ${b.toolUseMirrors} chars, not counted`;
+}
+
 function percent(ratio: number): string {
   return `${Math.round(ratio * 100)}%`;
 }
@@ -651,6 +717,7 @@ export const register: Register = (on: On, options: PluginOptions) => {
 
   on('session.compact', async ($, event, next) => {
     try {
+      $.ui.log(inputLine(inputBreakdown(event.messages)));
       const config: HookConfig = { ...configured, apiKey: await getApiKey($, configured) };
       let typed: TypedNote[] = [];
       if (!event.agentId) {
