@@ -11,6 +11,7 @@ import type {
 import { compact, messageChars, reductionRatio, resolveOptions } from '../src/compact.js';
 import { isStopHookFeedback } from '../src/feedback.js';
 import { buildJevRequest, DEFAULT_MODEL, parseJevResponse } from '../src/request.js';
+import { collectToolCalls } from '../src/state.js';
 import type {
   CompactOptions,
   CompactResult,
@@ -644,39 +645,157 @@ export function summarize(result: CompactResult): string {
   }; state ~${stats.stateTokens} tokens (${stats.stateStage}) in ${stats.requests} request(s)`;
 }
 
-const UI_LOG_MAX_CHARS = 4096;
+/**
+ * The most chars one string passed to `$.ui.log` may hold, every label
+ * included. Claude Code stores each as a notice that starts with
+ * `fast-jev-compaction: ` (21 chars) and cuts a long one at exactly 2,022 chars,
+ * ending in "…"; a 1,868-char notice was stored whole. Measured on this host.
+ */
+const UI_LOG_MAX_CHARS = 1800;
 
-export function decisionLog(result: CompactResult): string {
-  return result.decisions
-    .filter((d) => d.reason !== 'pinned')
-    .map(
-      (d) =>
-        `${d.id}:${d.tool}:${d.action}/call=${d.keepCall.toFixed(2)}/result=${d.keepResult.toFixed(2)}`,
-    )
-    .join(' ');
+/** Where a cut at `index` may fall in `text`: one back when it would split a surrogate pair. */
+function codePointCut(text: string, index: number): number {
+  const before = text.charCodeAt(index - 1);
+  const after = text.charCodeAt(index);
+  return before >= 0xd800 && before <= 0xdbff && after >= 0xdc00 && after <= 0xdfff ? index - 1 : index;
 }
 
+/**
+ * Packs entries, in order and a space apart, into parts of at most `room(n)`
+ * chars for part `n`. An entry too long for a part of its own starts a new part
+ * and is cut across as many as it needs, on code point boundaries. Throws a
+ * `RangeError` when a part cannot hold one code point.
+ */
+function packParts(entries: readonly string[], room: (part: number) => number): string[] {
+  const parts: string[] = [];
+  let current = '';
+  for (const entry of entries) {
+    const joined = current ? `${current} ${entry}` : entry;
+    if (joined.length <= room(parts.length + 1)) {
+      current = joined;
+      continue;
+    }
+    if (current) parts.push(current);
+    let rest = entry;
+    while (rest.length > room(parts.length + 1)) {
+      const cut = codePointCut(rest, room(parts.length + 1));
+      if (!(cut > 0)) throw new RangeError(`a log line of ${room(parts.length + 1)} chars cannot hold one code point`);
+      parts.push(rest.slice(0, cut));
+      rest = rest.slice(cut);
+    }
+    current = rest;
+  }
+  if (current) parts.push(current);
+  return parts;
+}
+
+/**
+ * Packs entries into lines of at most `maxChars`, each starting with
+ * `label(n, N)` for part `n` of `N`. The room a label leaves is measured with
+ * the final N: when the count gains a digit, everything is packed again.
+ */
+function labelledParts(
+  entries: readonly string[],
+  maxChars: number,
+  label: (part: number, count: number) => string,
+): string[] {
+  for (let digits = 1; ; digits += 1) {
+    const widest = 10 ** digits - 1;
+    const parts = packParts(entries, (part) => maxChars - label(part, widest).length);
+    if (String(parts.length).length <= digits) {
+      return parts.map((part, index) => `${label(index + 1, parts.length)}${part}`);
+    }
+  }
+}
+
+/**
+ * One `$.ui.log` line as the strings to log: unchanged when it fits in
+ * `maxChars`, otherwise cut into `(i/N) <chunk>` parts that each fit, label
+ * included, on code point boundaries. Throws a `RangeError` when `maxChars`
+ * cannot hold the label and one code point.
+ */
+export function logLines(text: string, maxChars: number = UI_LOG_MAX_CHARS): string[] {
+  if (text.length <= maxChars) return [text];
+  return labelledParts([text], maxChars, (part, count) => `(${part}/${count}) `);
+}
+
+/** Logs `text` through `$.ui.log`, in as many parts as the host's notice limit needs. */
+function log($: { ui: { log: (text: string) => void } }, text: string): void {
+  for (const line of logLines(text)) $.ui.log(line);
+}
+
+/** A call's input chars, counted exactly as `messageChars` counts tool input. */
+function inputChars(input: Record<string, unknown>): number {
+  return messageChars({ role: 'assistant', text: '', toolUses: [{ tool_use_id: '', tool: '', input }] });
+}
+
+/** Each call's input and result chars, by the id the decisions use (`t1`, `t2`, ...). */
+export type CallSizes = ReadonlyMap<string, { input: number; output: number }>;
+
+/**
+ * The sizes of the calls a compaction asks about. `compact` collects its calls
+ * the same way from the same messages, so the ids match its decisions.
+ */
+export function callSizes(messages: readonly Message[], preserveRecentMessages: number): CallSizes {
+  return new Map(
+    collectToolCalls(messages, preserveRecentMessages).map((call) => [
+      call.id,
+      { input: inputChars(call.input), output: call.resultChars },
+    ]),
+  );
+}
+
+function decisionEntries(result: CompactResult, sizes?: CallSizes): string[] {
+  return result.decisions
+    .filter((d) => d.reason !== 'pinned')
+    .map((d) => {
+      const size = sizes?.get(d.id);
+      return `${d.id}:${d.tool}:${d.action}/call=${d.keepCall.toFixed(2)}/result=${d.keepResult.toFixed(2)}${
+        size ? `/in=${size.input}/out=${size.output}` : ''
+      }`;
+    });
+}
+
+export function decisionLog(result: CompactResult, sizes?: CallSizes): string {
+  return decisionEntries(result, sizes).join(' ');
+}
+
+/**
+ * The decisions as `$.ui.log` lines of at most `maxChars`, label included:
+ * `decisions: <entries>` when they fit in one, otherwise
+ * `decisions (i/N): <entries>` parts. Whole entries are packed in order; one
+ * too long for a part of its own is cut across parts.
+ */
 export function decisionLogLines(
   result: CompactResult,
   maxChars: number = UI_LOG_MAX_CHARS,
+  sizes?: CallSizes,
 ): string[] {
-  const entries = decisionLog(result).split(' ').filter(Boolean);
+  const entries = decisionEntries(result, sizes);
   if (entries.length === 0) return ['decisions: (none)'];
-  const chunks: string[] = [];
-  let current = '';
-  for (const entry of entries) {
-    const next = current ? `${current} ${entry}` : entry;
-    if (current && next.length > maxChars - 24) {
-      chunks.push(current);
-      current = entry;
-    } else current = next;
+  const single = `decisions: ${entries.join(' ')}`;
+  if (single.length <= maxChars) return [single];
+  return labelledParts(entries, maxChars, (part, count) => `decisions (${part}/${count}): `);
+}
+
+/**
+ * The most a compaction could remove, in counts only: the calls it pins and
+ * the calls it asks about, each group's input and result chars, and the share
+ * of the window's chars (as the reduction counts them) that dropping every
+ * asked-about call would remove.
+ */
+export function boundsLine(messages: readonly Message[], preserveRecentMessages: number): string {
+  const groups = { pinned: { calls: 0, input: 0, output: 0 }, asked: { calls: 0, input: 0, output: 0 } };
+  for (const call of collectToolCalls(messages, preserveRecentMessages)) {
+    const group = call.pinned ? groups.pinned : groups.asked;
+    group.calls += 1;
+    group.input += inputChars(call.input);
+    group.output += call.resultChars;
   }
-  chunks.push(current);
-  return chunks.map((chunk, index) =>
-    chunks.length === 1
-      ? `decisions: ${chunk}`
-      : `decisions (${index + 1}/${chunks.length}): ${chunk}`,
-  );
+  const chars = messages.reduce((sum, message) => sum + messageChars(message), 0);
+  const share = chars === 0 ? 0 : ((groups.asked.input + groups.asked.output) / chars) * 100;
+  const { pinned, asked } = groups;
+  return `bounds: ${pinned.calls} pinned calls (in ${pinned.input}, out ${pinned.output}), ${asked.calls} asked about (in ${asked.input}, out ${asked.output}); dropping every asked-about call would remove at most ${share.toFixed(1)}% of ${chars} chars`;
 }
 
 async function getApiKey(
@@ -707,7 +826,7 @@ function notify(
   },
   text: string,
 ): void {
-  $.ui.log(text);
+  log($, text);
   $.ui.toast(text, { timeoutMs: 15_000 });
 }
 
@@ -717,17 +836,20 @@ export const register: Register = (on: On, options: PluginOptions) => {
 
   on('session.compact', async ($, event, next) => {
     try {
-      $.ui.log(inputLine(inputBreakdown(event.messages)));
+      log($, inputLine(inputBreakdown(event.messages)));
+      const { preserveRecentMessages } = resolveOptions(configured);
+      log($, boundsLine(event.messages, preserveRecentMessages));
       const config: HookConfig = { ...configured, apiKey: await getApiKey($, configured) };
       let typed: TypedNote[] = [];
       if (!event.agentId) {
         try {
           const { notes, problem, note } = await typedMessagesInLog($);
-          if (note) $.ui.log(note);
-          if (!notes) $.ui.log(`${problem}; typed messages are not protected in this compaction`);
+          if (note) log($, note);
+          if (!notes) log($, `${problem}; typed messages are not protected in this compaction`);
           else typed = notes;
         } catch (error) {
-          $.ui.log(
+          log(
+            $,
             `could not read the session log (${error instanceof Error ? error.message : String(error)}); typed messages are not protected in this compaction`,
           );
         }
@@ -736,7 +858,8 @@ export const register: Register = (on: On, options: PluginOptions) => {
         const response = await $.http.fetch(url, init);
         return { status: response.status, ok: response.ok, text: response.text };
       });
-      for (const line of decisionLogLines(result)) $.ui.log(line);
+      const sizes = callSizes(event.messages, preserveRecentMessages);
+      for (const line of decisionLogLines(result, UI_LOG_MAX_CHARS, sizes)) log($, line);
       if (reductionRatio(result) < config.minReductionRatio) {
         notify(
           $,
@@ -745,7 +868,7 @@ export const register: Register = (on: On, options: PluginOptions) => {
         return next(event);
       }
       const words = withTypedWords(event.messages, messages, typed);
-      if (words.added > 0) $.ui.log(`kept ${words.added} typed message(s) as text: the call each arrived with was dropped or cut`);
+      if (words.added > 0) log($, `kept ${words.added} typed message(s) as text: the call each arrived with was dropped or cut`);
       notify(
         $,
         `kept ${words.messages.length}/${event.messages.length} messages, no summary (${summarize(result)})`,
@@ -768,7 +891,8 @@ export const register: Register = (on: On, options: PluginOptions) => {
       compacting = true;
       await $.session.compact();
     } catch (error) {
-      $.ui.log(
+      log(
+        $,
         `auto-compact skipped (${error instanceof Error ? error.message : String(error)})`,
       );
     } finally {

@@ -69,10 +69,19 @@ fitted into the state budget, or the estimated reduction is below
 `minReductionRatio`, the hook logs a fallback and delegates to Claude Code's
 built-in compaction. The outcome is shown as a toast and logged with the
 reduction, per-reason counts, state size and request count; a per-call
-`decisions:` line with both probabilities is logged for diagnosis. The
-`turn.complete` hook requests
+`decisions:` line is logged for diagnosis. Each entry gives both probabilities
+and the call's sizes, as in `t3:Bash:drop_result/call=0.62/result=0.31/in=412/out=8120`:
+`in` is the call's input characters, counted as the reduction counts them, and
+`out` its result characters. The `turn.complete` hook requests
 compaction when `context.percent` reaches `compactAtPercent`, with an
 in-flight guard.
+
+Claude Code stores each logged line with a 21-character
+`fast-jev-compaction: ` prefix and cuts a long one at 2,022 characters, so
+every string the hook logs is at most 1,800 characters, label included. A
+longer line is logged in parts, `(i/N) <part>`. The decisions are packed whole
+into parts labelled `decisions (i/N):`; only an entry too long for a part of
+its own is cut across parts, and none is dropped. No cut splits a character.
 
 Every compaction, a subagent's included, first logs one `input:` line, before
 the session log is read or Jev is asked. It says what the hook was handed:
@@ -83,6 +92,13 @@ whitespace and `[`, and how long they are), assistant text, tool input and
 tool output. It also gives the characters of the result text each tool
 use mirrors, which the reduction does not count. The line carries counts
 only, never any message text.
+
+Right after it comes one `bounds:` line, also counts only: how many calls
+are pinned (in the first or the newest `preserveRecentMessages` messages) and
+how many Jev is asked about, each group's input and output characters, and
+the most the window could shrink if every asked-about call were dropped, as a
+share of its characters:
+`bounds: 6 pinned calls (in 1203, out 9112), 31 asked about (in 25629, out 65317); dropping every asked-about call would remove at most 42.0% of 215713 chars`.
 
 A message typed while a tool runs reaches the model as a `queued_command`
 attachment on that tool's result message, not as message text, so a dropped
