@@ -167,6 +167,8 @@ describe('reaching the minimum: tool inputs', () => {
     const after = await compact(messages, dropResults, minimum);
     expect(reductionRatio(after)).toBeLessThan(0.25);
     expect(after.messages[0]).toBe(messages[0]);
+    expect(after.stats).toMatchObject({ inputsShortened: 1, textsShortened: 0 });
+    expect(String(inputOf(after.messages, 'tool-1').command)).toMatch(NOTE);
   });
 });
 
@@ -247,5 +249,76 @@ describe('reaching the minimum: long assistant replies', () => {
     const text = after.messages[1]!.text;
     expect(text).toMatch(/shortened \d+ chars of this reply/);
     expect(text).not.toMatch(/[\ud800-\udbff](?![\udc00-\udfff])|(?<![\ud800-\udbff])[\udc00-\udfff]/);
+  });
+});
+
+describe('review findings: what the pass may cut and when it stops', () => {
+  it('never cuts a reply on a message the first pass already removed, so nothing comes back', async () => {
+    const messages = [
+      message('user', 'f'.repeat(36_360)),
+      message('assistant', ' '.repeat(10_000), {
+        toolUses: [{ tool_use_id: 'c1', tool: 'Bash', input: {}, text: 'ok' }],
+      }),
+      result('c1', 'ok'),
+      message('assistant', 'a'.repeat(3_000)),
+      message('user', 'z'),
+    ];
+    const lowKeep: JevAsker = {
+      async ask(_state, questions: JevQuestions) {
+        return {
+          answers: Object.fromEntries(Object.keys(questions).map((key) => [key, { type: 'noul' as const, noul: 0.1 }])),
+        };
+      },
+    };
+    const after = await compact(messages, lowKeep, { preserveRecentMessages: 1, goal: 'g', minReduction: 0.25 });
+    expect(after.messages).toHaveLength(3);
+    expect(after.messages[1]!.text.startsWith('aaa')).toBe(true);
+    expect(after.stats).toMatchObject({ textsShortened: 1, inputsShortened: 0 });
+    expect(reductionRatio(after)).toBeGreaterThanOrEqual(0.25);
+  });
+
+  it('reports which input message each output message came from', async () => {
+    const messages = inputHeavy();
+    const after = await compact(messages, dropResults, minimum);
+    expect(after.origins).toHaveLength(after.messages.length);
+    after.origins.forEach((source, index) => {
+      expect(source).toBeGreaterThanOrEqual(0);
+      expect(after.messages[index]!.role).toBe(messages[source]!.role);
+    });
+    expect([...after.origins].sort((a, b) => a - b)).toEqual(after.origins);
+  });
+
+  it('leaves a field whole when the configured head is longer than the field', async () => {
+    const messages = [
+      message('user', 'Fix the failing test.'),
+      call('tool-1', 'Bash', { large: 'x'.repeat(10_000), smaller: 'y'.repeat(2_000) }, 'ok'),
+      result('tool-1', 'ok'),
+      message('assistant', 'Done.'),
+      message('user', 'go ahead'),
+    ];
+    const after = await compact(messages, dropResults, {
+      preserveRecentMessages: 1,
+      goal: 'g',
+      minReduction: 0.25,
+      truncateHeadChars: 3_000,
+    });
+    const input = inputOf(after.messages, 'tool-1');
+    expect(input.smaller).toBe('y'.repeat(2_000));
+    expect(String(input.large)).toMatch(NOTE);
+    expect(JSON.stringify(input)).not.toMatch(/shortened -\d/);
+  });
+
+  it('keeps cutting when the whole-number goal rounds up to a ratio the result does not reach', async () => {
+    const minReduction = 0.45849647611589667;
+    const messages = [
+      message('user', 'f'.repeat(7)),
+      message('assistant', 'a'.repeat(3_000)),
+      message('assistant', 'b'.repeat(2_100)),
+      message('user', 'z'),
+    ];
+    const after = await compact(messages, keepAll, { preserveRecentMessages: 1, goal: 'g', minReduction });
+    expect(after.stats.charsBefore).toBe(5_108);
+    expect(reductionRatio(after)).toBeGreaterThanOrEqual(minReduction);
+    expect(after.stats.textsShortened).toBe(2);
   });
 });

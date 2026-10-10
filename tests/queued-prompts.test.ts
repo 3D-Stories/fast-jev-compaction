@@ -1,5 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import {
+  compactSession,
   projectDirName,
   register,
   typedNotes,
@@ -432,6 +433,44 @@ describe('withTypedWords', () => {
     const input = transcript();
     const { added } = withTypedWords(input, [input[0]!], [{ toolUseId: 'tool-9', prompt: 'old' }]);
     expect(added).toBe(0);
+  });
+});
+
+describe('withTypedWords after an old reply is shortened to reach the minimum', () => {
+  const config = { apiKey: 'k', model: 'm', compactAtPercent: 60, minReductionRatio: 0.25, preserveRecentMessages: 1 };
+  const words = '[message typed while Bash ran]: Use staging.';
+  const note = { toolUseId: 'c1', prompt: 'Use staging.' };
+
+  function withLongReply(): SessionMessage[] {
+    return [
+      message('user', 'Run tests.', { handle: 'h-0' }),
+      message('assistant', 'a'.repeat(10_000), { handle: 'h-1' }),
+      call('c1', 'Bash', 'ok'),
+      result('c1', 'ok'),
+      message('assistant', 'Done.', { handle: 'h-4' }),
+      message('user', 'Continue.', { handle: 'h-5' }),
+    ];
+  }
+
+  it('does not copy the words when the call it arrived with came back as the engine message', async () => {
+    const input = withLongReply();
+    const { result: compacted, messages: output } = await compactSession(input, config, jevFetch(0.9));
+    expect(compacted.stats.textsShortened).toBe(1);
+    expect(output[3]).toBe(input[3]);
+    const { messages, added } = withTypedWords(input, output, [note], compacted.origins);
+    expect(added).toBe(0);
+    expect(messages).toEqual(output);
+  });
+
+  it('puts the words before the next kept message, not at the end', async () => {
+    const input = withLongReply();
+    const { result: compacted, messages: output } = await compactSession(input, config, jevFetch(0.1));
+    expect(compacted.stats.textsShortened).toBe(1);
+    expect(output.map((m) => m.text.slice(0, 4))).toEqual(['Run ', 'aaaa', 'Done', 'Cont']);
+    const { messages, added } = withTypedWords(input, output, [note], compacted.origins);
+    expect(added).toBe(1);
+    expect(messages.map((m) => m.text.slice(0, 4))).toEqual(['Run ', 'aaaa', '[mes', 'Done', 'Cont']);
+    expect(messages[2]!.text).toBe(words);
   });
 });
 

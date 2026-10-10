@@ -126,6 +126,8 @@ export interface ResolvedCompactOptions {
 export interface CompactResult {
   /** The compacted transcript; untouched messages are the input objects. */
   messages: Message[];
+  /** For each message of `messages`, the index of the input message it came from, in input order. */
+  origins: number[];
   decisions: CallDecision[];
   stats: {
     messagesBefore: number;

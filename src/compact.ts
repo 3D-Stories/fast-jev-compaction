@@ -164,6 +164,16 @@ export function applyDecisions(
   calls: readonly ToolCall[],
   headChars: number,
 ): Message[] {
+  return applyDecisionsFrom(messages, decisions, calls, headChars).messages;
+}
+
+/** `applyDecisions`, and for each message it returns the index of the input message it came from. */
+function applyDecisionsFrom(
+  messages: readonly Message[],
+  decisions: readonly CallDecision[],
+  calls: readonly ToolCall[],
+  headChars: number,
+): { messages: Message[]; origins: number[] } {
   const byId = new Map(calls.map((call) => [call.id, call]));
   const actions = new Map<string, CallDecision['action']>();
   for (const decision of decisions) {
@@ -171,12 +181,14 @@ export function applyDecisions(
     if (call && decision.action !== 'keep') actions.set(call.tool_use_id, decision.action);
   }
   const kept: Message[] = [];
-  for (const message of messages) {
+  const origins: number[] = [];
+  for (const [source, message] of messages.entries()) {
     const touched =
       message.toolUses.some((tool) => actions.has(tool.tool_use_id)) ||
       (message.toolResults ?? []).some((result) => actions.has(result.tool_use_id));
     if (!touched) {
       kept.push(message);
+      origins.push(source);
       continue;
     }
     const toolUses = message.toolUses
@@ -224,6 +236,7 @@ export function applyDecisions(
       )
     ) {
       kept.push(message);
+      origins.push(source);
       continue;
     }
     if (message.text.trim().length === 0 && toolUses.length === 0 && toolResults.length === 0) {
@@ -232,8 +245,9 @@ export function applyDecisions(
     const rebuilt: Message = { role: message.role, text: message.text, toolUses };
     if (toolResults.length > 0) rebuilt.toolResults = toolResults;
     kept.push(rebuilt);
+    origins.push(source);
   }
-  return kept;
+  return { messages: kept, origins };
 }
 
 /** Characters of text, tool input and tool output a message holds. */
@@ -269,8 +283,10 @@ function shortenedText(text: string, head: number, tail: number, what: string): 
   const headEnd = splitsSurrogatePair(text, head) ? head - 1 : head;
   const tailStart = text.length - tail;
   const tailFrom = tail > 0 && splitsSurrogatePair(text, tailStart) ? tailStart + 1 : tailStart;
+  if (tailFrom <= headEnd) return text;
   const note = `[fast-jev-compaction shortened ${tailFrom - headEnd} chars of this ${what}]`;
-  return `${text.slice(0, headEnd)}\n${note}${tail > 0 ? `\n${text.slice(tailFrom)}` : ''}`;
+  const cut = `${text.slice(0, headEnd)}\n${note}${tail > 0 ? `\n${text.slice(tailFrom)}` : ''}`;
+  return cut.length < text.length ? cut : text;
 }
 
 /** A tool input with every long string in it, at any depth, shortened. Keys and short values are kept. */
@@ -292,12 +308,14 @@ type Cut =
 
 /**
  * Every cut the pass may make, biggest saving first within each kind, inputs before replies. Never a
- * pinned message, the first message, a message the user wrote, or the input of a call Jev kept or dropped.
+ * pinned message, the first message, a message the user wrote, a message the first pass already removed
+ * (`retained` holds the input indices it kept), or the input of a call Jev kept or dropped.
  */
 function shorteningCuts(
   messages: readonly Message[],
   decisions: readonly CallDecision[],
   calls: readonly ToolCall[],
+  retained: ReadonlySet<number>,
   options: ResolvedCompactOptions,
 ): Cut[] {
   const resultDropped = new Set(
@@ -308,6 +326,7 @@ function shorteningCuts(
   const inputs: Cut[] = [];
   const texts: Cut[] = [];
   messages.forEach((message, index) => {
+    if (!retained.has(index)) return;
     message.toolUses.forEach((tool, toolIndex) => {
       if (!droppedIds.has(tool.tool_use_id)) return;
       try {
@@ -358,34 +377,36 @@ function totalChars(messages: readonly Message[]): number {
  * When `first`, the messages Jev's decisions left, removes less than `minReduction` of the window, cuts
  * the long strings in the inputs of calls whose result was dropped, then the middle of the longest old
  * assistant replies, biggest saving first, and stops at the first cut that reaches it. With nothing left
- * to cut it returns everything it could cut, still short of the minimum.
+ * to cut it returns everything it could cut, still short of the minimum. `origins` says, for each
+ * message of `first`, which input message it came from; the cuts never add or remove a message.
  */
 function reachMinimum(
   messages: readonly Message[],
   decisions: readonly CallDecision[],
   calls: readonly ToolCall[],
-  first: Message[],
+  first: { messages: Message[]; origins: number[] },
   charsBefore: number,
   options: ResolvedCompactOptions,
-): { messages: Message[]; inputsShortened: number; textsShortened: number } {
-  const goal = Math.ceil(charsBefore * options.minReduction);
-  const removed = charsBefore - totalChars(first);
-  if (options.minReduction <= 0 || charsBefore === 0 || removed >= goal) {
-    return { messages: first, inputsShortened: 0, textsShortened: 0 };
+): { messages: Message[]; origins: number[]; inputsShortened: number; textsShortened: number } {
+  // The same ratio the caller checks, so a result that stops here is one the caller accepts.
+  const reached = (charsAfter: number) => (charsBefore - charsAfter) / charsBefore >= options.minReduction;
+  const firstChars = totalChars(first.messages);
+  if (options.minReduction <= 0 || charsBefore === 0 || reached(firstChars)) {
+    return { ...first, inputsShortened: 0, textsShortened: 0 };
   }
-  const cuts = shorteningCuts(messages, decisions, calls, options);
+  const cuts = shorteningCuts(messages, decisions, calls, new Set(first.origins), options);
   let take = 0;
-  let saved = removed;
-  while (take < cuts.length && saved < goal) saved += cuts[take++]!.saved;
+  let charsAfter = firstChars;
+  while (take < cuts.length && !reached(charsAfter)) charsAfter -= cuts[take++]!.saved;
   for (;;) {
     const chosen = cuts.slice(0, take);
     const rebuilt =
       take === 0
         ? first
-        : applyDecisions(withCuts(messages, chosen), decisions, calls, options.truncateHeadChars);
-    if (charsBefore - totalChars(rebuilt) >= goal || take >= cuts.length) {
+        : applyDecisionsFrom(withCuts(messages, chosen), decisions, calls, options.truncateHeadChars);
+    if (reached(totalChars(rebuilt.messages)) || take >= cuts.length) {
       return {
-        messages: rebuilt,
+        ...rebuilt,
         inputsShortened: chosen.filter((cut) => cut.kind === 'input').length,
         textsShortened: chosen.filter((cut) => cut.kind === 'text').length,
       };
@@ -428,13 +449,13 @@ export async function compact(
   const decisions = calls.map((call) =>
     decideCall(call, answers.get(call.id) ?? { keepCall: 1, keepResult: 1 }, resolved),
   );
-  const first = applyDecisions(
+  const first = applyDecisionsFrom(
     messages,
     decisions,
     calls,
     resolved.truncateHeadChars,
   );
-  const { messages: kept, inputsShortened, textsShortened } = reachMinimum(
+  const { messages: kept, origins, inputsShortened, textsShortened } = reachMinimum(
     messages,
     decisions,
     calls,
@@ -444,6 +465,7 @@ export async function compact(
   );
   return {
     messages: kept,
+    origins,
     decisions,
     stats: {
       messagesBefore: messages.length,
