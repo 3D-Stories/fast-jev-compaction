@@ -105,6 +105,12 @@ export interface CompactOptions {
   maxRequestTokens?: number;
   /** Characters of a dropped tool result to retain. Default 300. */
   truncateHeadChars?: number;
+  /**
+   * The share of the window (0 to 1) a compaction must remove. When Jev's decisions fall short of it,
+   * the long string fields of the inputs of calls whose result was dropped, and then the middle of the
+   * longest old assistant replies, are cut until it is reached or nothing is left to cut. Default 0: off.
+   */
+  minReduction?: number;
 }
 
 export interface ResolvedCompactOptions {
@@ -114,6 +120,7 @@ export interface ResolvedCompactOptions {
   maxStateTokens: number;
   maxRequestTokens: number;
   truncateHeadChars: number;
+  minReduction: number;
 }
 
 export interface CompactResult {
@@ -130,6 +137,10 @@ export interface CompactResult {
     resultsDropped: number;
     callsDropped: number;
     pinned: number;
+    /** Tool inputs cut to reach `minReduction`. */
+    inputsShortened: number;
+    /** Assistant replies cut to reach `minReduction`. */
+    textsShortened: number;
     stateTokens: number;
     /** Which fitting stage the state needed, '' when no request was made. */
     stateStage: string;

@@ -559,7 +559,10 @@ export async function compactSession(
   fetchFn: HookFetch,
 ): Promise<SessionCompaction> {
   if (!config.apiKey) throw new Error('TYPESAFE_API_KEY is not configured');
-  const result = await compact(messages, jevAsker(fetchFn, config.apiKey, config.model), config);
+  const result = await compact(messages, jevAsker(fetchFn, config.apiKey, config.model), {
+    ...config,
+    minReduction: config.minReductionRatio,
+  });
   return { result, messages: toSessionMessages(messages, result.messages) };
 }
 
@@ -628,6 +631,19 @@ export function inputLine(b: InputBreakdown): string {
   return `input: ${b.messages} messages (${b.userMessages} user, ${b.assistantMessages} assistant), ${b.chars} chars: user text ${b.userText} (${b.feedbackCopies} Stop hook feedback copies, ${b.feedbackChars} chars), assistant text ${b.assistantText}, tool input ${b.toolInput}, tool output ${b.toolOutput}; tool-use mirrors ${b.toolUseMirrors} chars, not counted`;
 }
 
+/** The model's window and how full it was when this compaction ran, so each model's real window is read from the log. */
+export function contextLine(
+  context: { window: number; tokens?: number; percent?: number },
+  compactAtPercent: number,
+  trigger: string,
+): string {
+  const where =
+    context.tokens !== undefined && context.percent !== undefined
+      ? `${context.tokens} tokens, ${context.percent}% of a ${context.window}-token window`
+      : `usage not reported for a ${context.window}-token window`;
+  return `context: ${where}; compactAtPercent ${compactAtPercent}; trigger ${trigger}`;
+}
+
 function percent(ratio: number): string {
   return `${Math.round(ratio * 100)}%`;
 }
@@ -639,6 +655,8 @@ export function summarize(result: CompactResult): string {
     stats.resultsDropped > 0 ? `${stats.resultsDropped} results truncated` : '',
     stats.callsDropped > 0 ? `${stats.callsDropped} call_dropped` : '',
     stats.pinned > 0 ? `${stats.pinned} pinned` : '',
+    stats.inputsShortened > 0 ? `${stats.inputsShortened} inputs shortened` : '',
+    stats.textsShortened > 0 ? `${stats.textsShortened} texts shortened` : '',
   ].filter(Boolean);
   return `${percent(reductionRatio(result))} reduction; ${
     parts.join(', ') || 'no tool calls'
@@ -839,6 +857,14 @@ export const register: Register = (on: On, options: PluginOptions) => {
       log($, inputLine(inputBreakdown(event.messages)));
       const { preserveRecentMessages } = resolveOptions(configured);
       log($, boundsLine(event.messages, preserveRecentMessages));
+      if (!event.agentId) {
+        try {
+          const { context } = await $.session.usage();
+          log($, contextLine(context, configured.compactAtPercent, event.trigger));
+        } catch {
+          // Advisory only: a compaction never waits on a usage read or fails over one.
+        }
+      }
       const config: HookConfig = { ...configured, apiKey: await getApiKey($, configured) };
       let typed: TypedNote[] = [];
       if (!event.agentId) {

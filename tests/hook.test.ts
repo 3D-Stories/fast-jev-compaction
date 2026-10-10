@@ -3,6 +3,7 @@ import {
   boundsLine,
   callSizes,
   compactSession,
+  contextLine,
   decisionLog,
   decisionLogLines,
   logLines,
@@ -305,7 +306,9 @@ describe('boundsLine', () => {
 type Handler = (fake: unknown, event: unknown, next: (e: unknown) => Promise<unknown>) => Promise<unknown>;
 
 /** The hook's handlers over a small fake engine that records every `$.ui.log` and toast. */
-function engine(fetch: HookFetch, errors: { read?: string; usage?: string } = {}) {
+type ContextUsage = { window: number; tokens?: number; percent?: number };
+
+function engine(fetch: HookFetch, errors: { read?: string; usage?: string; context?: ContextUsage } = {}) {
   const handlers: Record<string, Handler> = {};
   register(((name: string, handler: Handler) => (handlers[name] = handler)) as never, {
     preserveRecentMessages: 1,
@@ -322,6 +325,7 @@ function engine(fetch: HookFetch, errors: { read?: string; usage?: string } = {}
       id: async () => 'sess-1',
       cwd: async () => '/home/u/proj',
       usage: async () => {
+        if (errors.context) return { context: errors.context };
         throw new Error(errors.usage ?? 'no usage');
       },
       compact: async () => undefined,
@@ -398,5 +402,97 @@ describe('the session.compact hook logs', () => {
     expect(logs.length).toBeGreaterThanOrEqual(3);
     expect(logs.every((line) => line.length <= 1800)).toBe(true);
     expect(joinParts(logs)).toBe(`auto-compact skipped (${'u'.repeat(4000)})`);
+  });
+});
+
+/** One 20,000-char tool input whose result Jev drops, so the first pass lands far below the bar. */
+function bigInput(): SessionMessage[] {
+  return [
+    message('user', 'Fix the failing test.', { handle: 'h-0' }),
+    call('tool-1', 'Bash', { command: `BIG-${'x'.repeat(20_000)}` }, 'ok'),
+    result('tool-1', 'ok'),
+    message('assistant', 'Done.', { handle: 'h-5' }),
+    message('user', 'go ahead', { handle: 'h-6' }),
+  ];
+}
+
+const dropResultsOnly = (name: string) => (name.startsWith('call_') ? 0.9 : 0.1);
+
+describe('reaching the minimum in the hook', () => {
+  it('lifts a window below the bar by shortening the input of a call whose result was dropped', async () => {
+    const messages = bigInput();
+    const config = { ...resolveHookConfig({ preserveRecentMessages: 1 }), apiKey: 'k' };
+    const { result: output, messages: out } = await compactSession(messages, config, jevFetch(dropResultsOnly));
+    expect(output.stats.charsBefore).toBeGreaterThan(20_000);
+    expect(output.stats.charsAfter / output.stats.charsBefore).toBeLessThan(0.75);
+    expect(out[0]).toBe(messages[0]);
+    expect(out[1]?.handle).toBeUndefined();
+    expect(String(out[1]?.toolUses[0]?.input.command)).toMatch(/^BIG-x+\n\[fast-jev-compaction shortened \d+ chars of this tool input\]$/);
+    expect(out[3]).toBe(messages[3]);
+    expect(out[4]).toBe(messages[4]);
+    expect(summarize(output)).toMatch(/; 1 results truncated, 1 inputs shortened; state ~\d+ tokens/);
+  });
+
+  it('names a shortened reply in the summary and stays silent when nothing was shortened', async () => {
+    const config = { ...resolveHookConfig({ preserveRecentMessages: 1 }), apiKey: 'k' };
+    const { result: plain } = await compactSession(transcript(), config, jevFetch(() => 0.1));
+    expect(summarize(plain)).not.toMatch(/shortened/);
+    const messages = bigInput();
+    messages.splice(1, 0, message('assistant', `OLD-${'o'.repeat(30_000)}-END`, { handle: 'h-old' }));
+    const { result: output } = await compactSession(messages, config, jevFetch(dropResultsOnly));
+    expect(summarize(output)).toMatch(/1 inputs shortened/);
+    const textOnly = [messages[0]!, messages[1]!, messages[4]!, messages[5]!];
+    const { result: second } = await compactSession(textOnly, config, jevFetch(dropResultsOnly));
+    expect(summarize(second)).toMatch(/1 texts shortened/);
+  });
+
+  it('keeps the compaction instead of falling back when the pass reaches the bar', async () => {
+    const { compactHook, fake, toasts } = engine(jevFetch(dropResultsOnly));
+    const out = (await compactHook(fake, { trigger: 'auto', agentId: 'agent-1', messages: bigInput() }, async () => ({
+      skip: 'next',
+    }))) as { messages?: SessionMessage[]; skip?: string };
+    expect(out.skip).toBeUndefined();
+    expect(out.messages).toHaveLength(5);
+    expect(toasts).toHaveLength(1);
+    expect(toasts[0]).toMatch(/^kept 5\/5 messages, no summary \(\d+% reduction; .*1 inputs shortened/);
+  });
+
+  it('still falls back when even the pass cannot reach the bar, and says what it reached', async () => {
+    const messages = [message('user', `PINNED-${'q'.repeat(100_000)}`, { handle: 'h-0' }), ...bigInput().slice(1)];
+    const { compactHook, fake, toasts } = engine(jevFetch(dropResultsOnly));
+    const out = await compactHook(fake, { trigger: 'auto', agentId: 'agent-1', messages }, async () => ({ skip: 'next' }));
+    expect(out).toEqual({ skip: 'next' });
+    expect(toasts[0]).toMatch(/^fallback to built-in summary \(below 25% minimum: \d+% reduction/);
+  });
+});
+
+describe('contextLine', () => {
+  it('names the tokens, percent, window, trigger and the configured start point', () => {
+    expect(contextLine({ window: 1_000_000, tokens: 612_345, percent: 61 }, 60, 'auto')).toBe(
+      'context: 612345 tokens, 61% of a 1000000-token window; compactAtPercent 60; trigger auto',
+    );
+  });
+
+  it('says so when the host has not reported usage yet', () => {
+    expect(contextLine({ window: 200_000 }, 60, 'manual')).toBe(
+      'context: usage not reported for a 200000-token window; compactAtPercent 60; trigger manual',
+    );
+  });
+
+  it('is logged after the bounds line when usage can be read, and never when it cannot', async () => {
+    const messages = manyCalls(3);
+    const read = engine(jevFetch(() => 0.1), { context: { window: 250_000, tokens: 151_000, percent: 60 } });
+    await read.compactHook(read.fake, { trigger: 'auto', messages }, async () => ({ skip: 'next' }));
+    expect(read.logs[0]).toMatch(/^input: /);
+    expect(read.logs[1]).toBe(boundsLine(messages, 1));
+    expect(read.logs[2]).toBe(
+      'context: 151000 tokens, 60% of a 250000-token window; compactAtPercent 60; trigger auto',
+    );
+    const unread = engine(jevFetch(() => 0.1));
+    await unread.compactHook(unread.fake, { trigger: 'auto', messages }, async () => ({ skip: 'next' }));
+    expect(unread.logs.some((line) => line.startsWith('context:'))).toBe(false);
+    const agent = engine(jevFetch(() => 0.1), { context: { window: 250_000, tokens: 1, percent: 1 } });
+    await agent.compactHook(agent.fake, { trigger: 'auto', agentId: 'a-1', messages }, async () => ({ skip: 'next' }));
+    expect(agent.logs.some((line) => line.startsWith('context:'))).toBe(false);
   });
 });
