@@ -1,5 +1,5 @@
 import { noulAnswer } from './request.js';
-import { collectToolCalls, estimateTokens, fitState } from './state.js';
+import { collectToolCalls, estimateTokens, fitState, isPinned } from './state.js';
 import type {
   CallAnswer,
   CallDecision,
@@ -21,6 +21,7 @@ export const DEFAULT_OPTIONS: ResolvedCompactOptions = {
   maxStateTokens: 25_000,
   maxRequestTokens: 30_000,
   truncateHeadChars: 300,
+  minReduction: 0,
 };
 
 /** Tokens the request envelope (`model`, key names) adds around state and questions. */
@@ -49,6 +50,7 @@ export function resolveOptions(options: CompactOptions = {}): ResolvedCompactOpt
       0,
       Math.floor(finite(options.truncateHeadChars, DEFAULT_OPTIONS.truncateHeadChars)),
     ),
+    minReduction: Math.min(1, Math.max(0, finite(options.minReduction, DEFAULT_OPTIONS.minReduction))),
   };
 }
 
@@ -162,6 +164,16 @@ export function applyDecisions(
   calls: readonly ToolCall[],
   headChars: number,
 ): Message[] {
+  return applyDecisionsFrom(messages, decisions, calls, headChars).messages;
+}
+
+/** `applyDecisions`, and for each message it returns the index of the input message it came from. */
+function applyDecisionsFrom(
+  messages: readonly Message[],
+  decisions: readonly CallDecision[],
+  calls: readonly ToolCall[],
+  headChars: number,
+): { messages: Message[]; origins: number[] } {
   const byId = new Map(calls.map((call) => [call.id, call]));
   const actions = new Map<string, CallDecision['action']>();
   for (const decision of decisions) {
@@ -169,12 +181,14 @@ export function applyDecisions(
     if (call && decision.action !== 'keep') actions.set(call.tool_use_id, decision.action);
   }
   const kept: Message[] = [];
-  for (const message of messages) {
+  const origins: number[] = [];
+  for (const [source, message] of messages.entries()) {
     const touched =
       message.toolUses.some((tool) => actions.has(tool.tool_use_id)) ||
       (message.toolResults ?? []).some((result) => actions.has(result.tool_use_id));
     if (!touched) {
       kept.push(message);
+      origins.push(source);
       continue;
     }
     const toolUses = message.toolUses
@@ -222,6 +236,7 @@ export function applyDecisions(
       )
     ) {
       kept.push(message);
+      origins.push(source);
       continue;
     }
     if (message.text.trim().length === 0 && toolUses.length === 0 && toolResults.length === 0) {
@@ -230,8 +245,9 @@ export function applyDecisions(
     const rebuilt: Message = { role: message.role, text: message.text, toolUses };
     if (toolResults.length > 0) rebuilt.toolResults = toolResults;
     kept.push(rebuilt);
+    origins.push(source);
   }
-  return kept;
+  return { messages: kept, origins };
 }
 
 /** Characters of text, tool input and tool output a message holds. */
@@ -255,6 +271,148 @@ export function reductionRatio(result: Pick<CompactResult, 'stats'>): number {
 
 function count(decisions: readonly CallDecision[], reason: CallDecision['reason']): number {
   return decisions.filter((decision) => decision.reason === reason).length;
+}
+
+/** A string field shorter than this stays whole: cutting it saves too little. */
+const SHORTEN_FIELD_MIN = 1500;
+/** An assistant reply shorter than this stays whole. */
+const SHORTEN_TEXT_MIN = 2000;
+
+/** `text` as its first `head` chars, a note, and its last `tail` chars, never cut inside a surrogate pair. */
+function shortenedText(text: string, head: number, tail: number, what: string): string {
+  const headEnd = splitsSurrogatePair(text, head) ? head - 1 : head;
+  const tailStart = text.length - tail;
+  const tailFrom = tail > 0 && splitsSurrogatePair(text, tailStart) ? tailStart + 1 : tailStart;
+  if (tailFrom <= headEnd) return text;
+  const note = `[fast-jev-compaction shortened ${tailFrom - headEnd} chars of this ${what}]`;
+  const cut = `${text.slice(0, headEnd)}\n${note}${tail > 0 ? `\n${text.slice(tailFrom)}` : ''}`;
+  return cut.length < text.length ? cut : text;
+}
+
+/** A tool input with every long string in it, at any depth, shortened. Keys and short values are kept. */
+function shortenedInput(value: unknown, head: number): unknown {
+  if (typeof value === 'string') {
+    return value.length > SHORTEN_FIELD_MIN ? shortenedText(value, head, 0, 'tool input') : value;
+  }
+  if (Array.isArray(value)) return value.map((item) => shortenedInput(item, head));
+  if (value !== null && typeof value === 'object') {
+    return Object.fromEntries(Object.entries(value).map(([key, item]) => [key, shortenedInput(item, head)]));
+  }
+  return value;
+}
+
+/** One cut that would remove `saved` chars: a tool input of a call whose result was dropped, or an old reply. */
+type Cut =
+  | { kind: 'input'; saved: number; message: number; tool: number; input: Record<string, unknown> }
+  | { kind: 'text'; saved: number; message: number; text: string };
+
+/**
+ * Every cut the pass may make, biggest saving first within each kind, inputs before replies. Never a
+ * pinned message, the first message, a message the user wrote, a message the first pass already removed
+ * (`retained` holds the input indices it kept), or the input of a call Jev kept or dropped.
+ */
+function shorteningCuts(
+  messages: readonly Message[],
+  decisions: readonly CallDecision[],
+  calls: readonly ToolCall[],
+  retained: ReadonlySet<number>,
+  options: ResolvedCompactOptions,
+): Cut[] {
+  const resultDropped = new Set(
+    decisions.filter((decision) => decision.reason === 'result_dropped').map((decision) => decision.id),
+  );
+  const droppedIds = new Set(calls.filter((call) => resultDropped.has(call.id)).map((call) => call.tool_use_id));
+  const head = options.truncateHeadChars;
+  const inputs: Cut[] = [];
+  const texts: Cut[] = [];
+  messages.forEach((message, index) => {
+    if (!retained.has(index)) return;
+    message.toolUses.forEach((tool, toolIndex) => {
+      if (!droppedIds.has(tool.tool_use_id)) return;
+      try {
+        const input = shortenedInput(tool.input, head) as Record<string, unknown>;
+        const saved = JSON.stringify(tool.input).length - JSON.stringify(input).length;
+        if (saved > 0) inputs.push({ kind: 'input', saved, message: index, tool: toolIndex, input });
+      } catch {
+        // An input that cannot be walked or measured stays whole.
+      }
+    });
+    if (
+      message.role === 'assistant' &&
+      message.text.length > SHORTEN_TEXT_MIN &&
+      !isPinned(index, messages.length, options.preserveRecentMessages)
+    ) {
+      const text = shortenedText(message.text, head, head, 'reply');
+      const saved = message.text.length - text.length;
+      if (saved > 0) texts.push({ kind: 'text', saved, message: index, text });
+    }
+  });
+  const biggest = (a: Cut, b: Cut) => b.saved - a.saved;
+  return [...inputs.sort(biggest), ...texts.sort(biggest)];
+}
+
+function withCuts(messages: readonly Message[], cuts: readonly Cut[]): Message[] {
+  const out = [...messages];
+  for (const cut of cuts) {
+    const message = out[cut.message]!;
+    const next: Message = {
+      role: message.role,
+      text: cut.kind === 'text' ? cut.text : message.text,
+      toolUses:
+        cut.kind === 'input'
+          ? message.toolUses.map((tool, index) => (index === cut.tool ? { ...tool, input: cut.input } : tool))
+          : message.toolUses,
+    };
+    if (message.toolResults) next.toolResults = message.toolResults;
+    out[cut.message] = next;
+  }
+  return out;
+}
+
+function totalChars(messages: readonly Message[]): number {
+  return messages.reduce((sum, message) => sum + messageChars(message), 0);
+}
+
+/**
+ * When `first`, the messages Jev's decisions left, removes less than `minReduction` of the window, cuts
+ * the long strings in the inputs of calls whose result was dropped, then the middle of the longest old
+ * assistant replies, biggest saving first, and stops at the first cut that reaches it. With nothing left
+ * to cut it returns everything it could cut, still short of the minimum. `origins` says, for each
+ * message of `first`, which input message it came from; the cuts never add or remove a message.
+ */
+function reachMinimum(
+  messages: readonly Message[],
+  decisions: readonly CallDecision[],
+  calls: readonly ToolCall[],
+  first: { messages: Message[]; origins: number[] },
+  charsBefore: number,
+  options: ResolvedCompactOptions,
+): { messages: Message[]; origins: number[]; inputsShortened: number; textsShortened: number } {
+  // The same ratio the caller checks, so a result that stops here is one the caller accepts.
+  const reached = (charsAfter: number) => (charsBefore - charsAfter) / charsBefore >= options.minReduction;
+  const firstChars = totalChars(first.messages);
+  if (options.minReduction <= 0 || charsBefore === 0 || reached(firstChars)) {
+    return { ...first, inputsShortened: 0, textsShortened: 0 };
+  }
+  const cuts = shorteningCuts(messages, decisions, calls, new Set(first.origins), options);
+  let take = 0;
+  let charsAfter = firstChars;
+  while (take < cuts.length && !reached(charsAfter)) charsAfter -= cuts[take++]!.saved;
+  for (;;) {
+    const chosen = cuts.slice(0, take);
+    const rebuilt =
+      take === 0
+        ? first
+        : applyDecisionsFrom(withCuts(messages, chosen), decisions, calls, options.truncateHeadChars);
+    if (reached(totalChars(rebuilt.messages)) || take >= cuts.length) {
+      return {
+        ...rebuilt,
+        inputsShortened: chosen.filter((cut) => cut.kind === 'input').length,
+        textsShortened: chosen.filter((cut) => cut.kind === 'text').length,
+      };
+    }
+    take++;
+  }
 }
 
 /**
@@ -291,25 +449,36 @@ export async function compact(
   const decisions = calls.map((call) =>
     decideCall(call, answers.get(call.id) ?? { keepCall: 1, keepResult: 1 }, resolved),
   );
-  const kept = applyDecisions(
+  const first = applyDecisionsFrom(
     messages,
     decisions,
     calls,
     resolved.truncateHeadChars,
   );
+  const { messages: kept, origins, inputsShortened, textsShortened } = reachMinimum(
+    messages,
+    decisions,
+    calls,
+    first,
+    charsBefore,
+    resolved,
+  );
   return {
     messages: kept,
+    origins,
     decisions,
     stats: {
       messagesBefore: messages.length,
       messagesAfter: kept.length,
       charsBefore,
-      charsAfter: kept.reduce((sum, message) => sum + messageChars(message), 0),
+      charsAfter: totalChars(kept),
       calls: calls.length,
       kept: count(decisions, 'kept'),
       resultsDropped: count(decisions, 'result_dropped'),
       callsDropped: count(decisions, 'call_dropped'),
       pinned: count(decisions, 'pinned'),
+      inputsShortened,
+      textsShortened,
       stateTokens: fitted.tokens,
       stateStage: fitted.stage,
       requests: batches.length,

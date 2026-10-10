@@ -424,8 +424,9 @@ export function withTypedWords(
   input: readonly SessionMessage[],
   output: readonly SessionMessage[],
   notes: readonly TypedNote[],
+  origins?: readonly number[],
 ): { messages: SessionMessage[]; added: number } {
-  const at = alignment(input, output);
+  const at = alignment(input, output, origins);
   const before = new Map<number, SessionMessage[]>();
   let added = 0;
   for (const note of notes) {
@@ -461,14 +462,22 @@ function toolIds(message: SessionMessage): string[] {
 }
 
 /**
- * Where each input message ended up in the output, by index. The library keeps
- * input order, so one pass pairs them: an output message is the next input
- * message itself, or that message rebuilt (same role and text, holding only
- * calls the input message held). A rebuilt message with no calls left has text,
- * since one with neither is removed.
+ * Where each input message ended up in the output, by index. With `origins`, which the library
+ * reports for every output message, that is exact, even for a message whose text was shortened.
+ * Without them, the library keeps input order, so one pass pairs them: an output message is the next
+ * input message itself, or that message rebuilt (same role and text, holding only calls the input
+ * message held). A rebuilt message with no calls left has text, since one with neither is removed.
  */
-function alignment(input: readonly SessionMessage[], output: readonly SessionMessage[]): Map<number, number> {
+function alignment(
+  input: readonly SessionMessage[],
+  output: readonly SessionMessage[],
+  origins?: readonly number[],
+): Map<number, number> {
   const at = new Map<number, number>();
+  if (origins && origins.length === output.length) {
+    origins.forEach((source, index) => at.set(source, index));
+    return at;
+  }
   let next = 0;
   input.forEach((message, index) => {
     const candidate = output[next];
@@ -559,7 +568,10 @@ export async function compactSession(
   fetchFn: HookFetch,
 ): Promise<SessionCompaction> {
   if (!config.apiKey) throw new Error('TYPESAFE_API_KEY is not configured');
-  const result = await compact(messages, jevAsker(fetchFn, config.apiKey, config.model), config);
+  const result = await compact(messages, jevAsker(fetchFn, config.apiKey, config.model), {
+    ...config,
+    minReduction: config.minReductionRatio,
+  });
   return { result, messages: toSessionMessages(messages, result.messages) };
 }
 
@@ -628,6 +640,19 @@ export function inputLine(b: InputBreakdown): string {
   return `input: ${b.messages} messages (${b.userMessages} user, ${b.assistantMessages} assistant), ${b.chars} chars: user text ${b.userText} (${b.feedbackCopies} Stop hook feedback copies, ${b.feedbackChars} chars), assistant text ${b.assistantText}, tool input ${b.toolInput}, tool output ${b.toolOutput}; tool-use mirrors ${b.toolUseMirrors} chars, not counted`;
 }
 
+/** The model's window and how full it was when this compaction ran, so each model's real window is read from the log. */
+export function contextLine(
+  context: { window: number; tokens?: number; percent?: number },
+  compactAtPercent: number,
+  trigger: string,
+): string {
+  const where =
+    context.tokens !== undefined && context.percent !== undefined
+      ? `${context.tokens} tokens, ${context.percent}% of a ${context.window}-token window`
+      : `usage not reported for a ${context.window}-token window`;
+  return `context: ${where}; compactAtPercent ${compactAtPercent}; trigger ${trigger}`;
+}
+
 function percent(ratio: number): string {
   return `${Math.round(ratio * 100)}%`;
 }
@@ -639,6 +664,8 @@ export function summarize(result: CompactResult): string {
     stats.resultsDropped > 0 ? `${stats.resultsDropped} results truncated` : '',
     stats.callsDropped > 0 ? `${stats.callsDropped} call_dropped` : '',
     stats.pinned > 0 ? `${stats.pinned} pinned` : '',
+    stats.inputsShortened > 0 ? `${stats.inputsShortened} inputs shortened` : '',
+    stats.textsShortened > 0 ? `${stats.textsShortened} texts shortened` : '',
   ].filter(Boolean);
   return `${percent(reductionRatio(result))} reduction; ${
     parts.join(', ') || 'no tool calls'
@@ -839,6 +866,14 @@ export const register: Register = (on: On, options: PluginOptions) => {
       log($, inputLine(inputBreakdown(event.messages)));
       const { preserveRecentMessages } = resolveOptions(configured);
       log($, boundsLine(event.messages, preserveRecentMessages));
+      if (!event.agentId) {
+        try {
+          const { context } = await $.session.usage();
+          log($, contextLine(context, configured.compactAtPercent, event.trigger));
+        } catch {
+          // Advisory only: a compaction never waits on a usage read or fails over one.
+        }
+      }
       const config: HookConfig = { ...configured, apiKey: await getApiKey($, configured) };
       let typed: TypedNote[] = [];
       if (!event.agentId) {
@@ -867,7 +902,7 @@ export const register: Register = (on: On, options: PluginOptions) => {
         );
         return next(event);
       }
-      const words = withTypedWords(event.messages, messages, typed);
+      const words = withTypedWords(event.messages, messages, typed, result.origins);
       if (words.added > 0) log($, `kept ${words.added} typed message(s) as text: the call each arrived with was dropped or cut`);
       notify(
         $,
