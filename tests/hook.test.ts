@@ -463,6 +463,68 @@ describe('reaching the minimum in the hook', () => {
     const out = await compactHook(fake, { trigger: 'auto', agentId: 'agent-1', messages }, async () => ({ skip: 'next' }));
     expect(out).toEqual({ skip: 'next' });
     expect(toasts[0]).toMatch(/^fallback to built-in summary \(below 25% minimum: \d+% reduction/);
+    const [, minimum, shown] = /below (-?\d+)% minimum: (-?\d+)% reduction/.exec(toasts[0]!)!;
+    expect(Number(shown)).toBeLessThan(Number(minimum));
+  });
+
+  it('never prints a missed reduction that rounds up to the minimum', async () => {
+    const messages = [
+      message('user', `PINNED-${'q'.repeat(10_000)}`, { handle: 'h-0' }),
+      call('tool-1', 'Read', { file_path: 'a.ts' }, 'ok'),
+      result('tool-1', 'r'.repeat(3_794)),
+      message('assistant', 'Done.', { handle: 'h-5' }),
+      message('user', 'go ahead', { handle: 'h-6' }),
+    ];
+    const config = { ...resolveHookConfig({ preserveRecentMessages: 1 }), apiKey: 'k' };
+    const { result: reached } = await compactSession(messages, config, jevFetch(dropResultsOnly));
+    expect(reached.stats.charsAfter / reached.stats.charsBefore).toBeCloseTo(1 - 0.246, 3);
+    const { compactHook, fake, toasts } = engine(jevFetch(dropResultsOnly));
+    const out = await compactHook(fake, { trigger: 'auto', agentId: 'agent-1', messages }, async () => ({ skip: 'next' }));
+    expect(out).toEqual({ skip: 'next' });
+    expect(toasts[0]).toMatch(/^fallback to built-in summary \(below 25% minimum: 24% reduction; /);
+  });
+});
+
+/** An old 1,500-char reply and one read whose result Jev drops: `resultChars` 1,000 lands at 23.9%, 1,040 at 25.1%. */
+function shortReply(resultChars: number): SessionMessage[] {
+  return [
+    message('user', 'Fix the failing test.', { handle: 'h-0' }),
+    message('assistant', `OLD-${'o'.repeat(1_492)}-END`, { handle: 'h-old' }),
+    call('tool-1', 'Read', { file_path: 'a.ts' }, 'ok'),
+    result('tool-1', 'r'.repeat(resultChars)),
+    message('assistant', 'Done.', { handle: 'h-5' }),
+    message('user', 'go ahead', { handle: 'h-6' }),
+  ];
+}
+
+describe('the final tier in the hook', () => {
+  it('cuts an old reply of 1,001-2,000 chars when the pass falls short, and logs what it aims for', async () => {
+    const messages = shortReply(1_000);
+    const { compactHook, fake, logs, toasts } = engine(jevFetch(dropResultsOnly));
+    const out = (await compactHook(fake, { trigger: 'auto', agentId: 'agent-1', messages }, async () => ({
+      skip: 'next',
+    }))) as { messages?: SessionMessage[]; skip?: string };
+    expect(out.skip).toBeUndefined();
+    expect(toasts[0]).toMatch(/^kept 6\/6 messages, no summary \(\d+% reduction; .*1 texts shortened/);
+    const reply = out.messages![1]!.text;
+    expect(reply.startsWith('OLD-o')).toBe(true);
+    expect(reply.endsWith('o-END')).toBe(true);
+    expect(reply).toMatch(/\n\[fast-jev-compaction shortened \d+ chars of this reply\]\n/);
+    const lastDecisions = logs.map((line) => line.startsWith('decisions')).lastIndexOf(true);
+    expect(logs[lastDecisions + 1]).toBe(
+      'reach: aims for 25%; a final tier also cuts old replies of 1,001-2,000 chars',
+    );
+  });
+
+  it('keeps a window the pass already lifts to 25% without cutting a shorter reply', async () => {
+    const messages = shortReply(1_040);
+    const { compactHook, fake, toasts } = engine(jevFetch(dropResultsOnly));
+    const out = (await compactHook(fake, { trigger: 'auto', agentId: 'agent-1', messages }, async () => ({
+      skip: 'next',
+    }))) as { messages?: SessionMessage[]; skip?: string };
+    expect(toasts[0]).toMatch(/^kept 6\/6 messages, no summary \(25% reduction; /);
+    expect(toasts[0]).not.toMatch(/shortened/);
+    expect(out.messages![1]).toBe(messages[1]);
   });
 });
 
