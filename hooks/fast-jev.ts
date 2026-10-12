@@ -657,7 +657,7 @@ function percent(ratio: number): string {
   return `${Math.round(ratio * 100)}%`;
 }
 
-export function summarize(result: CompactResult): string {
+export function summarize(result: CompactResult, reduction: string = percent(reductionRatio(result))): string {
   const { stats } = result;
   const parts = [
     stats.kept > 0 ? `${stats.kept} kept` : '',
@@ -667,9 +667,18 @@ export function summarize(result: CompactResult): string {
     stats.inputsShortened > 0 ? `${stats.inputsShortened} inputs shortened` : '',
     stats.textsShortened > 0 ? `${stats.textsShortened} texts shortened` : '',
   ].filter(Boolean);
-  return `${percent(reductionRatio(result))} reduction; ${
+  return `${reduction} reduction; ${
     parts.join(', ') || 'no tool calls'
   }; state ~${stats.stateTokens} tokens (${stats.stateStage}) in ${stats.requests} request(s)`;
+}
+
+/**
+ * The notice for a result below `minimum`. `percent` rounds, so 24.6% would print as "25%" beside a 25%
+ * minimum; the reduction is rounded down instead, and capped one under the printed minimum.
+ */
+export function fallbackNotice(result: CompactResult, minimum: number): string {
+  const shown = Math.min(Math.floor(reductionRatio(result) * 100), Math.round(minimum * 100) - 1);
+  return `fallback to built-in summary (below ${percent(minimum)} minimum: ${summarize(result, `${shown}%`)})`;
 }
 
 /**
@@ -895,11 +904,9 @@ export const register: Register = (on: On, options: PluginOptions) => {
       });
       const sizes = callSizes(event.messages, preserveRecentMessages);
       for (const line of decisionLogLines(result, UI_LOG_MAX_CHARS, sizes)) log($, line);
+      log($, `reach: aims for ${percent(config.minReductionRatio)}; a final tier also cuts old replies of 1,001-2,000 chars`);
       if (reductionRatio(result) < config.minReductionRatio) {
-        notify(
-          $,
-          `fallback to built-in summary (below ${percent(config.minReductionRatio)} minimum: ${summarize(result)})`,
-        );
+        notify($, fallbackNotice(result, config.minReductionRatio));
         return next(event);
       }
       const words = withTypedWords(event.messages, messages, typed, result.origins);

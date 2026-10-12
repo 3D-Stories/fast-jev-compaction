@@ -94,6 +94,7 @@ describe('reaching the minimum: tool inputs', () => {
   it('changes nothing when the first pass already reaches the minimum', async () => {
     const messages = [
       message('user', 'Fix the failing test.'),
+      message('assistant', `OLD-${'o'.repeat(1_500)}`),
       call('tool-1', 'Read', { file_path: 'src/a.ts' }, 'z'.repeat(20_000)),
       result('tool-1', 'z'.repeat(20_000)),
       message('assistant', 'Done.'),
@@ -103,6 +104,7 @@ describe('reaching the minimum: tool inputs', () => {
     expect(reductionRatio(plain)).toBeGreaterThanOrEqual(0.25);
     const asked = await compact(messages, dropResults, minimum);
     expect(asked.messages).toEqual(plain.messages);
+    expect(asked.messages[1]).toBe(messages[1]);
     expect(asked.stats).toMatchObject({ inputsShortened: 0, textsShortened: 0 });
   });
 
@@ -203,10 +205,12 @@ describe('reaching the minimum: long assistant replies', () => {
   it('shortens inputs first and leaves a reply whole when the inputs reach the minimum', async () => {
     const messages = inputHeavy();
     const reply = `OLD-${'r'.repeat(10_000)}`;
-    messages.splice(1, 0, message('assistant', reply));
+    const shorter = message('assistant', `SHORTER-${'s'.repeat(1_500)}`);
+    messages.splice(1, 0, message('assistant', reply), shorter);
     const after = await compact(messages, dropResults, minimum);
     expect(reductionRatio(after)).toBeGreaterThanOrEqual(0.25);
     expect(after.messages[1]!.text).toBe(reply);
+    expect(after.messages[2]).toBe(shorter);
     expect(after.stats).toMatchObject({ inputsShortened: 1, textsShortened: 0 });
   });
 
@@ -226,7 +230,7 @@ describe('reaching the minimum: long assistant replies', () => {
 
   it('never shortens a recent reply, the first message, or a reply under the length floor', async () => {
     const recent = `RECENT-${'c'.repeat(30_000)}`;
-    const small = `SMALL-${'d'.repeat(1_500)}`;
+    const small = `SMALL-${'d'.repeat(994)}`;
     const messages = [
       message('user', `FIRST-${'f'.repeat(30_000)}`),
       message('assistant', small),
@@ -249,6 +253,43 @@ describe('reaching the minimum: long assistant replies', () => {
     const text = after.messages[1]!.text;
     expect(text).toMatch(/shortened \d+ chars of this reply/);
     expect(text).not.toMatch(/[\ud800-\udbff](?![\udc00-\udfff])|(?<![\ud800-\udbff])[\udc00-\udfff]/);
+  });
+});
+
+/** Old replies of 2,500, 1,500, 1,001 and 1,000 chars after a 5,000-char first message. */
+function shorterReplies(): Message[] {
+  return [
+    message('user', 'f'.repeat(5_000)),
+    message('assistant', 'a'.repeat(2_500)),
+    message('assistant', `B-HEAD-${'b'.repeat(1_486)}-TAIL`),
+    message('assistant', 'c'.repeat(1_001)),
+    message('assistant', 'd'.repeat(1_000)),
+    message('assistant', 'Done.'),
+    message('user', 'go ahead'),
+  ];
+}
+
+describe('reaching the minimum: the final tier', () => {
+  it('cuts old replies of 1,001-2,000 chars only after every other cut falls short', async () => {
+    const messages = shorterReplies();
+    const after = await compact(messages, keepAll, minimum);
+    expect(reductionRatio(after)).toBeGreaterThanOrEqual(0.25);
+    expect(after.messages[0]).toBe(messages[0]);
+    expect(after.messages[1]!.text).toMatch(/^a{300}\n\[fast-jev-compaction shortened \d+ chars of this reply\]\na{300}$/);
+    const tier = after.messages[2]!.text;
+    expect(tier.startsWith('B-HEAD-b')).toBe(true);
+    expect(tier.endsWith('b-TAIL')).toBe(true);
+    expect(tier).toMatch(/\n\[fast-jev-compaction shortened \d+ chars of this reply\]\n/);
+    expect(after.messages[3]!.text).toMatch(NOTE);
+    expect(after.messages[4]).toBe(messages[4]);
+    expect(after.stats).toMatchObject({ inputsShortened: 0, textsShortened: 3 });
+
+    const reachedByThePass = await compact(messages, keepAll, { ...options, minReduction: 0.15 });
+    expect(reductionRatio(reachedByThePass)).toBeGreaterThanOrEqual(0.15);
+    expect(reachedByThePass.messages[1]!.text).toBe(after.messages[1]!.text);
+    expect(reachedByThePass.messages.slice(2)).toEqual(messages.slice(2));
+    expect(reachedByThePass.messages[2]).toBe(messages[2]);
+    expect(reachedByThePass.stats).toMatchObject({ inputsShortened: 0, textsShortened: 1 });
   });
 });
 

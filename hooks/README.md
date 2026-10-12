@@ -76,6 +76,25 @@ and the call's sizes, as in `t3:Bash:drop_result/call=0.62/result=0.31/in=412/ou
 compaction when `context.percent` reaches `compactAtPercent`, with an
 in-flight guard.
 
+When Jev's decisions remove less than `minReductionRatio`, a pass first cuts
+the long strings in the inputs of calls whose result was dropped, then the
+middle of old assistant replies over 2,000 characters, biggest saving first,
+and stops at the first cut that reaches the minimum. Only when every one of
+those cuts still falls short does a final tier also cut old assistant replies
+of 1,001-2,000 characters, keeping their first and last `truncateHeadChars`
+characters around a `[fast-jev-compaction shortened N chars of this reply]`
+note; a window the pass already lifts to the minimum is never touched by it.
+Its cuts are counted in `texts shortened`. Every compaction logs, after the
+`decisions:` lines,
+`reach: aims for 25%; a final tier also cuts old replies of 1,001-2,000 chars`
+(the percent is `minReductionRatio`).
+
+A fallback below the minimum prints the reduction rounded down and at most one
+under the printed minimum, so 24.6% reads
+`fallback to built-in summary (below 25% minimum: 24% reduction; ...)`. A
+`minReductionRatio` under 0.005 prints as `0%`, and the reduction is then
+shown as `-1%`.
+
 Claude Code stores each logged line with a 21-character
 `fast-jev-compaction: ` prefix and cuts a long one at 2,022 characters, so
 every string the hook logs is at most 1,800 characters, label included. A

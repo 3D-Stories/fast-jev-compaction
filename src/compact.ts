@@ -277,6 +277,8 @@ function count(decisions: readonly CallDecision[], reason: CallDecision['reason'
 const SHORTEN_FIELD_MIN = 1500;
 /** An assistant reply shorter than this stays whole. */
 const SHORTEN_TEXT_MIN = 2000;
+/** The final tier cuts an old reply longer than this and not longer than `SHORTEN_TEXT_MIN`. */
+const REPLY_TIER_MIN = 1000;
 
 /** `text` as its first `head` chars, a note, and its last `tail` chars, never cut inside a surrogate pair. */
 function shortenedText(text: string, head: number, tail: number, what: string): string {
@@ -351,6 +353,30 @@ function shorteningCuts(
   return [...inputs.sort(biggest), ...texts.sort(biggest)];
 }
 
+/**
+ * The final tier: old assistant replies of `REPLY_TIER_MIN` + 1 to `SHORTEN_TEXT_MIN` chars, start and end
+ * kept, biggest saving first, under the same rules as the replies `shorteningCuts` returns.
+ */
+function replyTierCuts(
+  messages: readonly Message[],
+  retained: ReadonlySet<number>,
+  options: ResolvedCompactOptions,
+): Cut[] {
+  const head = options.truncateHeadChars;
+  const cuts: Cut[] = [];
+  messages.forEach((message, index) => {
+    if (!retained.has(index)) return;
+    if (message.role !== 'assistant' || message.text.length <= REPLY_TIER_MIN || message.text.length > SHORTEN_TEXT_MIN) {
+      return;
+    }
+    if (isPinned(index, messages.length, options.preserveRecentMessages)) return;
+    const text = shortenedText(message.text, head, head, 'reply');
+    const saved = message.text.length - text.length;
+    if (saved > 0) cuts.push({ kind: 'text', saved, message: index, text });
+  });
+  return cuts.sort((a, b) => b.saved - a.saved);
+}
+
 function withCuts(messages: readonly Message[], cuts: readonly Cut[]): Message[] {
   const out = [...messages];
   for (const cut of cuts) {
@@ -373,37 +399,25 @@ function totalChars(messages: readonly Message[]): number {
   return messages.reduce((sum, message) => sum + messageChars(message), 0);
 }
 
-/**
- * When `first`, the messages Jev's decisions left, removes less than `minReduction` of the window, cuts
- * the long strings in the inputs of calls whose result was dropped, then the middle of the longest old
- * assistant replies, biggest saving first, and stops at the first cut that reaches it. With nothing left
- * to cut it returns everything it could cut, still short of the minimum. `origins` says, for each
- * message of `first`, which input message it came from; the cuts never add or remove a message.
- */
-function reachMinimum(
+type Reached = { messages: Message[]; origins: number[]; inputsShortened: number; textsShortened: number };
+
+/** Takes `cuts` in order and stops at the first that reaches the minimum, or when none is left. */
+function takeUntil(
   messages: readonly Message[],
   decisions: readonly CallDecision[],
   calls: readonly ToolCall[],
   first: { messages: Message[]; origins: number[] },
-  charsBefore: number,
-  options: ResolvedCompactOptions,
-): { messages: Message[]; origins: number[]; inputsShortened: number; textsShortened: number } {
-  // The same ratio the caller checks, so a result that stops here is one the caller accepts.
-  const reached = (charsAfter: number) => (charsBefore - charsAfter) / charsBefore >= options.minReduction;
-  const firstChars = totalChars(first.messages);
-  if (options.minReduction <= 0 || charsBefore === 0 || reached(firstChars)) {
-    return { ...first, inputsShortened: 0, textsShortened: 0 };
-  }
-  const cuts = shorteningCuts(messages, decisions, calls, new Set(first.origins), options);
+  cuts: readonly Cut[],
+  reached: (charsAfter: number) => boolean,
+  headChars: number,
+): Reached {
   let take = 0;
-  let charsAfter = firstChars;
+  let charsAfter = totalChars(first.messages);
   while (take < cuts.length && !reached(charsAfter)) charsAfter -= cuts[take++]!.saved;
   for (;;) {
     const chosen = cuts.slice(0, take);
     const rebuilt =
-      take === 0
-        ? first
-        : applyDecisionsFrom(withCuts(messages, chosen), decisions, calls, options.truncateHeadChars);
+      take === 0 ? first : applyDecisionsFrom(withCuts(messages, chosen), decisions, calls, headChars);
     if (reached(totalChars(rebuilt.messages)) || take >= cuts.length) {
       return {
         ...rebuilt,
@@ -413,6 +427,37 @@ function reachMinimum(
     }
     take++;
   }
+}
+
+/**
+ * When `first`, the messages Jev's decisions left, removes less than `minReduction` of the window, cuts
+ * the long strings in the inputs of calls whose result was dropped, then the middle of the longest old
+ * assistant replies, biggest saving first, and stops at the first cut that reaches it. Only when every
+ * one of those cuts still falls short does a final tier also cut old replies of 1,001-2,000 chars. With
+ * nothing left to cut it returns everything it could cut, still short of the minimum. `origins` says, for
+ * each message of `first`, which input message it came from; the cuts never add or remove a message.
+ */
+function reachMinimum(
+  messages: readonly Message[],
+  decisions: readonly CallDecision[],
+  calls: readonly ToolCall[],
+  first: { messages: Message[]; origins: number[] },
+  charsBefore: number,
+  options: ResolvedCompactOptions,
+): Reached {
+  // The same ratio the caller checks, so a result that stops here is one the caller accepts.
+  const reached = (charsAfter: number) => (charsBefore - charsAfter) / charsBefore >= options.minReduction;
+  if (options.minReduction <= 0 || charsBefore === 0 || reached(totalChars(first.messages))) {
+    return { ...first, inputsShortened: 0, textsShortened: 0 };
+  }
+  const retained = new Set(first.origins);
+  const head = options.truncateHeadChars;
+  const cuts = shorteningCuts(messages, decisions, calls, retained, options);
+  const done = takeUntil(messages, decisions, calls, first, cuts, reached, head);
+  if (reached(totalChars(done.messages))) return done;
+  const tier = replyTierCuts(messages, retained, options);
+  if (tier.length === 0) return done;
+  return takeUntil(messages, decisions, calls, first, [...cuts, ...tier], reached, head);
 }
 
 /**
