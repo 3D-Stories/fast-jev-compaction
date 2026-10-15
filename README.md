@@ -135,7 +135,12 @@ Claude Code 2.1.274 type reference.
 
 ### Install in Claude Code
 
-Function hooks are an early-access Claude Code feature (2.1.274+), so the
+The hook was measured running on Claude Code 2.1.285 to 2.1.296. It did not
+run on 2.1.299, 2.1.300 or 2.1.301 on a machine that an organization manages.
+Read [Which Claude Code versions it works on](#which-claude-code-versions-it-works-on)
+before you install.
+
+Function hooks are an early-access Claude Code feature, so the
 opt-in flag must be set wherever Claude Code runs, e.g. in `~/.claude/settings.json`:
 
 ```json
@@ -161,6 +166,56 @@ could not remove enough (short sessions, or when it fails).
 To run from a checkout without installing: `CLAUDE_CODE_ENABLE_FUNCTION_HOOKS=1 claude --plugin-dir .`
 from the repository root. No publishing step is required; the marketplace is
 just the repo's `.claude-plugin/marketplace.json`.
+
+### Which Claude Code versions it works on
+
+Every number here was measured on one machine, from its own session logs. They
+count the compactions found in those logs, dated 2026-09-30 to 2026-10-15 (UTC).
+The type reference in `types/claude-code.d.ts` was written by Claude Code 2.1.274.
+
+| Claude Code | Compactions measured | Result |
+| --- | --- | --- |
+| 2.1.285 to 2.1.292 (no 2.1.291 seen) | 30 | hook ran and acted in all 30 |
+| 2.1.295 | 21 | hook ran in all 21: 19 acted, 2 fell back by design |
+| 2.1.296 | 457 | hook ran in all 457: 443 acted, 14 fell back by design |
+| 2.1.299 | 44 | hook ran in none of the 44 |
+| 2.1.300 | 62 | hook ran in none of the 62 |
+| 2.1.301 | 1 | hook did not run in one manual `/compact` probe |
+
+"Acted" means the pruned history replaced the built-in summary. "Fell back by
+design" means the hook ran and chose the built-in summary, as described above.
+Versions not in the table were not measured.
+
+**Why it stops.** Claude Code 2.1.299, 2.1.300 and 2.1.301 hold a built-in
+security default. Where an organization manages Claude Code, it passes
+`session.compact` over the plugins a person installs. An organization manages
+Claude Code when there are managed settings, or when the account belongs to a
+Team or Enterprise organization. This plugin works through `session.compact`,
+so its hook never runs there. Claude Code writes its own built-in summary
+instead.
+
+**How to check.** Open `/plugin` and select this plugin. On such a machine its
+entry shows this note:
+
+> Its hooks on session.compact do not run here: where an organization manages
+> Claude Code, these events pass over the plugins you install
+>
+> → Only a plugin that counts as your organization's own runs hooks on these
+> events. An administrator sets that up in managed settings
+
+Then run `/compact`. No line that starts with `fast-jev-compaction:` follows it.
+
+**What works.** Only a plugin that the organization lists in its managed
+settings runs these hooks. An administrator sets that up. This plugin does not
+come set up as an organization's own plugin today. Nothing in this repository
+can change that.
+
+**What this section does not claim.**
+
+- It does not claim the plugin works on any version newer than 2.1.301.
+- It does not claim that an account outside organization management is
+  affected. That case was not measured.
+- It does not claim 2.1.301 was tested beyond one manual `/compact`.
 
 ## Development
 
