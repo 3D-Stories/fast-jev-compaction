@@ -135,7 +135,13 @@ Claude Code 2.1.274 type reference.
 
 ### Install in Claude Code
 
-Function hooks are an early-access Claude Code feature (2.1.274+), so the
+The hook was measured running on Claude Code 2.1.285 to 2.1.296. It did not
+leave a hook line on 2.1.299, 2.1.300 or 2.1.301 on a machine that an
+organization manages.
+Read [Which Claude Code versions it works on](#which-claude-code-versions-it-works-on)
+before you install.
+
+Function hooks are an early-access Claude Code feature, so the
 opt-in flag must be set wherever Claude Code runs, e.g. in `~/.claude/settings.json`:
 
 ```json
@@ -152,15 +158,72 @@ claude plugin install fast-jev-compaction@fast-jev-compaction
 
 The install prompts for the plugin options (API key, thresholds, `truncateHeadChars`,
 …); leave them at their defaults to use `TYPESAFE_API_KEY` from the environment.
-Restart Claude Code or run `/reload-plugins`. From then on `/compact` (and
-auto-compaction) goes through Jev: the toast reads
+Restart Claude Code or run `/reload-plugins`. From then on, when the hook runs,
+`/compact` and auto-compaction go through Jev. The toast then reads
 `fast-jev-compaction: kept N/M messages, no summary (…)` when the pruned history
-replaced the built-in summary, or `fallback to built-in summary (…)` when Jev
-could not remove enough (short sessions, or when it fails).
+replaced the built-in summary. It reads `fallback to built-in summary (…)` when
+Jev could not remove enough (short sessions, or when it fails). On Claude Code
+2.1.299 and later, where `/plugin` shows the
+[passed-over note](#which-claude-code-versions-it-works-on), the hook does not
+run and no toast appears.
 
 To run from a checkout without installing: `CLAUDE_CODE_ENABLE_FUNCTION_HOOKS=1 claude --plugin-dir .`
 from the repository root. No publishing step is required; the marketplace is
 just the repo's `.claude-plugin/marketplace.json`.
+
+### Which Claude Code versions it works on
+
+Every number here was measured on one machine, from its own session logs. They
+count the compactions found in those logs, dated 2026-09-30 to 2026-10-15 (UTC).
+The table reports the hook lines those logs show. It is not a direct record of
+each hook run.
+
+| Claude Code | Compactions measured | Logged result |
+| --- | --- | --- |
+| 2.1.285 to 2.1.292 (no 2.1.291 seen) | 30 | hook line found in all 30: 30 acted |
+| 2.1.295 | 21 | hook line found in all 21: 19 acted, 2 fell back by design |
+| 2.1.296 | 457 | hook line found in all 457: 443 acted, 14 fell back by design |
+| 2.1.299 | 44 | no hook line in any of the 44 |
+| 2.1.300 | 62 | no hook line in any of the 62 |
+| 2.1.301 | 1 | no hook line in one manual `/compact` probe |
+
+"Acted" means the hook line reports that the pruned history replaced the
+built-in summary. "Fell back by design" means the hook line reports that the
+hook chose the built-in summary, as described above. For 13 of the 457 compactions
+on 2.1.296, the log cannot say for certain which compaction a hook line belongs
+to. The 2.1.299 and 2.1.300 logs have no separate record of whether the hook
+ran. Versions not in the table were not measured.
+
+**Why it stops.** Claude Code 2.1.299, 2.1.300 and 2.1.301 hold a built-in
+security default. While that default is active, it passes `session.compact`
+over the plugins a person installs. Managed settings, or an account in a Team or
+Enterprise organization, are the usual reasons the default is active. An
+administrator controls the exact setting. This plugin works through
+`session.compact`, so its hook does not run while the default is active. Claude
+Code writes its own built-in summary instead.
+
+**How to check.** The `/plugin` screen is the test, not a guess about the
+account. Open `/plugin` and select this plugin. While the default is active,
+its entry shows this note:
+
+> Its hooks on session.compact do not run here: where an organization manages
+> Claude Code, these events pass over the plugins you install
+>
+> → Only a plugin that counts as your organization's own runs hooks on these
+> events. An administrator sets that up in managed settings
+
+Then run `/compact`. No line that starts with `fast-jev-compaction:` follows it.
+
+**What works while the default is active.** Only a plugin that the
+organization lists in its managed settings runs these hooks. An administrator
+sets that up. This plugin does not come set up as an organization's own plugin
+today. Nothing in this repository can change that.
+
+**What this section does not claim.**
+
+- It does not claim that an account outside organization management is
+  affected. That case was not measured. The exact account type that Claude Code
+  checks was not read on the measured machine.
 
 ## Development
 
