@@ -119,6 +119,18 @@ the most the window could shrink if every asked-about call were dropped, as a
 share of its characters:
 `bounds: 6 pinned calls (in 1203, out 9112), 31 asked about (in 25629, out 65317); dropping every asked-about call would remove at most 42.0% of 215713 chars`.
 
+Every compaction also writes one record file,
+`~/.claude/fast-jev-compaction/records/<session id>/<UTC time>-<main or agent id>-<suffix>.json`,
+after its final line. It holds one JSON object: `v` (1), `at`, `session`,
+`agentId` (`null` for the main conversation), `trigger`, `outcome` (`kept` or
+`fallback`), `messagesIn`, `messagesKept` (only when kept) and `detail`, the
+same text as the final `kept ...` or `fallback ...` line. Claude Code 2.1.302
+was seen to leave some turns' lines out of the session log, and this hook's
+lines with them (#17). The record still shows that the hook ran and what it
+did. A subagent's record sits in its parent session's folder. A record that
+cannot be written logs `could not write the compaction record (<reason>)` and
+changes nothing else. Nothing deletes old records.
+
 A message typed while a tool runs reaches the model as a `queued_command`
 attachment on that tool's result message, not as message text, so a dropped
 or rebuilt result message would lose it. The hook reads the session log (a

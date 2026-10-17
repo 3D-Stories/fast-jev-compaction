@@ -866,11 +866,64 @@ function notify(
   $.ui.toast(text, { timeoutMs: 15_000 });
 }
 
+/**
+ * One compaction's outcome. Each is written to its own file because Claude Code
+ * can leave a turn's lines, and so this hook's `ui.log` lines, out of the
+ * session log (#17): the record still shows that the hook ran and what it did.
+ */
+export type CompactionRecord = {
+  v: 1;
+  at: string;
+  session: string;
+  agentId: string | null;
+  trigger: string;
+  outcome: 'kept' | 'fallback';
+  messagesIn: number;
+  messagesKept?: number;
+  detail: string;
+};
+
+/** A path segment made of letters, digits, `_` and `-` only, so no id can leave its folder. */
+function segment(text: string): string {
+  return text.replace(/[^A-Za-z0-9_-]/g, '_');
+}
+
+/** Where a record goes: `~/.claude/fast-jev-compaction/records/<session>/<time>-<main or agent>-<suffix>.json`. */
+export function recordPath(home: string, record: CompactionRecord, suffix: string): string {
+  const name = `${record.at.replace(/[:.]/g, '-')}-${segment(record.agentId ?? 'main')}-${segment(suffix)}.json`;
+  return `${home}/.claude/fast-jev-compaction/records/${segment(record.session)}/${name}`;
+}
+
+type RecordAccess = {
+  env: { get: (name: string) => Promise<string | undefined> };
+  session: { id: () => Promise<string> };
+  fs: { write: (path: string, text: string) => Promise<void> };
+  ui: { log: (text: string) => void };
+};
+
+/** Writes the record; a failure is logged and never changes the compaction. */
+async function writeRecord($: RecordAccess, record: Omit<CompactionRecord, 'v' | 'session'>): Promise<void> {
+  try {
+    const home = await $.env.get('HOME');
+    if (!home) throw new Error('HOME is not set');
+    const full: CompactionRecord = { v: 1, session: await $.session.id(), ...record };
+    await $.fs.write(recordPath(home, full, Math.random().toString(36).slice(2, 8)), `${JSON.stringify(full)}\n`);
+  } catch (error) {
+    log($, `could not write the compaction record (${error instanceof Error ? error.message : String(error)})`);
+  }
+}
+
 export const register: Register = (on: On, options: PluginOptions) => {
   const configured = resolveHookConfig(options);
   let compacting = false;
 
   on('session.compact', async ($, event, next) => {
+    const base = {
+      at: new Date().toISOString(),
+      agentId: event.agentId ?? null,
+      trigger: String(event.trigger),
+      messagesIn: event.messages.length,
+    };
     try {
       log($, inputLine(inputBreakdown(event.messages)));
       const { preserveRecentMessages } = resolveOptions(configured);
@@ -906,21 +959,21 @@ export const register: Register = (on: On, options: PluginOptions) => {
       for (const line of decisionLogLines(result, UI_LOG_MAX_CHARS, sizes)) log($, line);
       log($, `reach: aims for ${percent(config.minReductionRatio)}; a final tier also cuts old replies of 1,001-2,000 chars`);
       if (reductionRatio(result) < config.minReductionRatio) {
-        notify($, fallbackNotice(result, config.minReductionRatio));
+        const notice = fallbackNotice(result, config.minReductionRatio);
+        notify($, notice);
+        await writeRecord($, { ...base, outcome: 'fallback', detail: notice });
         return next(event);
       }
       const words = withTypedWords(event.messages, messages, typed, result.origins);
       if (words.added > 0) log($, `kept ${words.added} typed message(s) as text: the call each arrived with was dropped or cut`);
-      notify(
-        $,
-        `kept ${words.messages.length}/${event.messages.length} messages, no summary (${summarize(result)})`,
-      );
+      const kept = `kept ${words.messages.length}/${event.messages.length} messages, no summary (${summarize(result)})`;
+      notify($, kept);
+      await writeRecord($, { ...base, outcome: 'kept', messagesKept: words.messages.length, detail: kept });
       return { messages: words.messages };
     } catch (error) {
-      notify(
-        $,
-        `fallback to built-in summary (${error instanceof Error ? error.message : String(error)})`,
-      );
+      const notice = `fallback to built-in summary (${error instanceof Error ? error.message : String(error)})`;
+      notify($, notice);
+      await writeRecord($, { ...base, outcome: 'fallback', detail: notice });
       return next(event);
     }
   });

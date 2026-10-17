@@ -176,7 +176,8 @@ just the repo's `.claude-plugin/marketplace.json`.
 Every number here was measured on one machine, from its own session logs. They
 count the compactions found in those logs, dated 2026-09-30 to 2026-10-15 (UTC).
 The table reports the hook lines those logs show. It is not a direct record of
-each hook run.
+each hook run. From 0.3.8 each run also writes its own record file, which does
+not depend on the session log (see `hooks/README.md`).
 
 | Claude Code | Compactions measured | Logged result |
 | --- | --- | --- |

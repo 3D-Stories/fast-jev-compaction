@@ -1,14 +1,14 @@
 ## Deploy
 
-This fork deploys to the machine that installs the plugin from it (marketplace `fast-jev-compaction`, source
-`https://github.com/3D-Stories/fast-jev-compaction.git`).
+This fork deploys to one machine. Since 2026-10-15 that machine runs it as a managed plugin,
+`fast-jev-compaction@fast-jev-compaction-managed`: root-owned `/etc/claude-code/managed-settings.json` enables it, read in
+place from a clone of `main` at `/home/rocky00717/rawgentic/projects/fast-jev-compaction-managed/plugin` (#15). The old git
+install (marketplace `fast-jev-compaction`) stays installed but disabled.
 
 1. In the PR, bump `version` in `.claude-plugin/plugin.json` and `.claude-plugin/marketplace.json` (fork versions 0.3.x).
-2. After the merge: `claude plugin marketplace update fast-jev-compaction`, then
-   `claude plugin update fast-jev-compaction@fast-jev-compaction`.
-3. Verify: `~/.claude/plugins/installed_plugins.json` shows the new version and the merge sha, and every file under
-   `hooks src .claude-plugin types` in `~/.claude/plugins/cache/fast-jev-compaction/fast-jev-compaction/<version>/`
-   equals `origin/main` (`git show origin/main:<f> | cmp - <cache>/<f>`).
+2. After the merge: `git -C /home/rocky00717/rawgentic/projects/fast-jev-compaction-managed/plugin pull --ff-only`, and set
+   the same `version` in the wrapper's `/home/rocky00717/rawgentic/projects/fast-jev-compaction-managed/.claude-plugin/marketplace.json`.
+3. Verify: the clone's `HEAD` is the merge sha and its `git status` is clean. There is no cache copy to compare.
 4. Prove it live in a fresh probe session (a throwaway herdr tab): type a message while a 50 s command runs, then
    `/compact`. The typed message must survive. Add a probe for the change being deployed, and require a log line
    only the new build emits.
