@@ -924,9 +924,16 @@ function writeRecord($: RecordAccess, record: Omit<CompactionRecord, 'v' | 'sess
     if (!home) throw new Error('HOME is not set');
     const full: CompactionRecord = { v: 1, session: await $.session.id(), ...record };
     await $.fs.write(recordPath(home, full, recordSuffix()), `${JSON.stringify(full)}\n`);
-  })().catch((error: unknown) =>
-    quietLog($, `could not write the compaction record (${error instanceof Error ? error.message : String(error)})`),
-  );
+  })().catch((error: unknown) => quietLog($, `could not write the compaction record (${reasonOf(error)})`));
+}
+
+/** An error's text; never throws, even for a value String() cannot convert or a throwing `message`. */
+function reasonOf(error: unknown): string {
+  try {
+    return error instanceof Error ? error.message : String(error);
+  } catch {
+    return 'an error that cannot be shown as text';
+  }
 }
 
 /** Logs `text`; a log that throws is ignored, because a record never changes the compaction. */

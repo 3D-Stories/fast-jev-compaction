@@ -359,6 +359,8 @@ function engine(
       list: async () => [],
       write: async (path: string, text: string) => {
         if (errors.write === 'hang') return new Promise<void>(() => undefined);
+        // A rejection value that String() cannot convert.
+        if (errors.write === 'unprintable') return Promise.reject(Object.create(null));
         if (errors.write) throw new Error(errors.write);
         writes.push({ path, text });
       },
@@ -538,6 +540,21 @@ describe('the compaction record (#17)', () => {
     expect(logs.filter((line) => line.includes('compaction record'))).toEqual([]);
     const config = { ...resolveHookConfig({ preserveRecentMessages: 1 }), apiKey: 'k' };
     expect(out.messages).toEqual((await compactSession(messages, config, fetch)).messages);
+  });
+
+  it('logs a write that rejects with a value String() cannot convert, and leaves no unhandled rejection', async () => {
+    const unhandled: unknown[] = [];
+    const onUnhandled = (reason: unknown) => unhandled.push(reason);
+    process.on('unhandledRejection', onUnhandled);
+    try {
+      const { compactHook, fake, logs } = engine(jevFetch(() => 0.1), { write: 'unprintable' });
+      await compactHook(fake, { trigger: 'auto', messages: manyCalls(60) }, async () => ({ skip: 'next' }));
+      await new Promise<void>((resolve) => setImmediate(resolve));
+      expect(logs).toContain('could not write the compaction record (an error that cannot be shown as text)');
+      expect(unhandled).toEqual([]);
+    } finally {
+      process.off('unhandledRejection', onUnhandled);
+    }
   });
 
   it('records and logs no failure when the runtime has no AbortSignal.timeout', async () => {
