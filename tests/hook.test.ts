@@ -319,6 +319,8 @@ function engine(
     /** `ui.log` throws for a line that starts with this. */
     logThrows?: string;
     session?: string;
+    /** The write rejects with this value. */
+    rejectWith?: () => unknown;
   } = {},
 ) {
   const handlers: Record<string, Handler> = {};
@@ -359,8 +361,7 @@ function engine(
       list: async () => [],
       write: async (path: string, text: string) => {
         if (errors.write === 'hang') return new Promise<void>(() => undefined);
-        // A rejection value that String() cannot convert.
-        if (errors.write === 'unprintable') return Promise.reject(Object.create(null));
+        if (errors.rejectWith) return Promise.reject(errors.rejectWith());
         if (errors.write) throw new Error(errors.write);
         writes.push({ path, text });
       },
@@ -542,15 +543,32 @@ describe('the compaction record (#17)', () => {
     expect(out.messages).toEqual((await compactSession(messages, config, fetch)).messages);
   });
 
-  it('logs a write that rejects with a value String() cannot convert, and leaves no unhandled rejection', async () => {
+  it('logs a write rejected with any value once, and leaves no unhandled rejection', async () => {
+    const throwingMessage = new Error();
+    Object.defineProperty(throwingMessage, 'message', {
+      get: () => {
+        throw new Error('no message');
+      },
+    });
+    const cases: [string, () => unknown, string][] = [
+      ['an ordinary error', () => new Error('EACCES'), 'EACCES'],
+      ['a value String() cannot convert', () => Object.create(null), 'an error that cannot be shown as text'],
+      ['an error whose message String() cannot convert', () => Object.assign(new Error(), { message: Object.create(null) }), 'an error that cannot be shown as text'],
+      ['an error whose message is a symbol', () => Object.assign(new Error(), { message: Symbol('failure') }), 'Symbol(failure)'],
+      ['an error whose message getter throws', () => throwingMessage, 'an error that cannot be shown as text'],
+    ];
     const unhandled: unknown[] = [];
     const onUnhandled = (reason: unknown) => unhandled.push(reason);
     process.on('unhandledRejection', onUnhandled);
     try {
-      const { compactHook, fake, logs } = engine(jevFetch(() => 0.1), { write: 'unprintable' });
-      await compactHook(fake, { trigger: 'auto', messages: manyCalls(60) }, async () => ({ skip: 'next' }));
-      await new Promise<void>((resolve) => setImmediate(resolve));
-      expect(logs).toContain('could not write the compaction record (an error that cannot be shown as text)');
+      for (const [name, rejectWith, reason] of cases) {
+        const { compactHook, fake, logs } = engine(jevFetch(() => 0.1), { rejectWith });
+        await compactHook(fake, { trigger: 'auto', messages: manyCalls(60) }, async () => ({ skip: 'next' }));
+        await new Promise<void>((resolve) => setImmediate(resolve));
+        expect(logs.filter((line) => line.includes('compaction record')), name).toEqual([
+          `could not write the compaction record (${reason})`,
+        ]);
+      }
       expect(unhandled).toEqual([]);
     } finally {
       process.off('unhandledRejection', onUnhandled);

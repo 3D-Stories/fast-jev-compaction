@@ -927,10 +927,14 @@ function writeRecord($: RecordAccess, record: Omit<CompactionRecord, 'v' | 'sess
   })().catch((error: unknown) => quietLog($, `could not write the compaction record (${reasonOf(error)})`));
 }
 
-/** An error's text; never throws, even for a value String() cannot convert or a throwing `message`. */
+/**
+ * An error's text as a plain string. Never throws: a value or `message` that
+ * String() cannot convert, a non-string `message` and a throwing getter all end here.
+ */
 function reasonOf(error: unknown): string {
   try {
-    return error instanceof Error ? error.message : String(error);
+    const text: unknown = error instanceof Error ? error.message : error;
+    return typeof text === 'string' ? text : String(text);
   } catch {
     return 'an error that cannot be shown as text';
   }
