@@ -7,6 +7,7 @@ import {
   decisionLog,
   decisionLogLines,
   logLines,
+  RECORD_WAIT_MS,
   register,
   resolveHookConfig,
   summarize,
@@ -308,7 +309,19 @@ type Handler = (fake: unknown, event: unknown, next: (e: unknown) => Promise<unk
 /** The hook's handlers over a small fake engine that records every `$.ui.log` and toast. */
 type ContextUsage = { window: number; tokens?: number; percent?: number };
 
-function engine(fetch: HookFetch, errors: { read?: string; usage?: string; context?: ContextUsage } = {}) {
+function engine(
+  fetch: HookFetch,
+  errors: {
+    read?: string;
+    usage?: string;
+    context?: ContextUsage;
+    /** A reason the write rejects with, or `hang` for a write that never settles. */
+    write?: string;
+    /** `ui.log` throws for a line that starts with this. */
+    logThrows?: string;
+    session?: string;
+  } = {},
+) {
   const handlers: Record<string, Handler> = {};
   register(((name: string, handler: Handler) => (handlers[name] = handler)) as never, {
     preserveRecentMessages: 1,
@@ -316,13 +329,20 @@ function engine(fetch: HookFetch, errors: { read?: string; usage?: string; conte
   });
   const logs: string[] = [];
   const toasts: string[] = [];
+  const writes: { path: string; text: string }[] = [];
   const fake = {
     env: { get: async (name: string) => (name === 'HOME' ? '/home/u' : undefined) },
     settings: { read: async () => ({}) },
     http: { fetch },
-    ui: { log: (text: string) => logs.push(text), toast: (text: string) => toasts.push(text) },
+    ui: {
+      log: (text: string) => {
+        if (errors.logThrows && text.startsWith(errors.logThrows)) throw new Error('log sink failed');
+        logs.push(text);
+      },
+      toast: (text: string) => toasts.push(text),
+    },
     session: {
-      id: async () => 'sess-1',
+      id: async () => errors.session ?? 'sess-1',
       cwd: async () => '/home/u/proj',
       usage: async () => {
         if (errors.context) return { context: errors.context };
@@ -338,9 +358,14 @@ function engine(fetch: HookFetch, errors: { read?: string; usage?: string; conte
         return '';
       },
       list: async () => [],
+      write: async (path: string, text: string) => {
+        if (errors.write === 'hang') return new Promise<void>(() => undefined);
+        if (errors.write) throw new Error(errors.write);
+        writes.push({ path, text });
+      },
     },
   };
-  return { compactHook: handlers['session.compact']!, turnHook: handlers['turn.complete']!, fake, logs, toasts };
+  return { compactHook: handlers['session.compact']!, turnHook: handlers['turn.complete']!, fake, logs, toasts, writes };
 }
 
 function manyCalls(count: number): SessionMessage[] {
@@ -402,6 +427,145 @@ describe('the session.compact hook logs', () => {
     expect(logs.length).toBeGreaterThanOrEqual(3);
     expect(logs.every((line) => line.length <= 1800)).toBe(true);
     expect(joinParts(logs)).toBe(`auto-compact skipped (${'u'.repeat(4000)})`);
+  });
+});
+
+const RECORDS = '/home/u/.claude/fast-jev-compaction/records/sess-1/';
+
+describe('the compaction record (#17)', () => {
+  it('writes one record for a compaction it keeps', async () => {
+    const { compactHook, fake, writes } = engine(jevFetch(() => 0.1));
+    const out = (await compactHook(fake, { trigger: 'auto', messages: manyCalls(60) }, async () => ({
+      skip: 'next',
+    }))) as { messages: SessionMessage[] };
+    expect(writes).toHaveLength(1);
+    expect(writes[0]!.path.startsWith(RECORDS)).toBe(true);
+    expect(writes[0]!.path.slice(RECORDS.length)).toMatch(/^\d{4}-\d\d-\d\dT\d\d-\d\d-\d\d-\d{3}Z-main-[a-z0-9]+\.json$/);
+    const record = JSON.parse(writes[0]!.text);
+    expect(record).toMatchObject({
+      v: 1,
+      session: 'sess-1',
+      agentId: null,
+      trigger: 'auto',
+      outcome: 'kept',
+      messagesIn: 122,
+      messagesKept: out.messages.length,
+    });
+    expect(record.detail).toMatch(/^kept \d+\/122 messages, no summary \(/);
+  });
+
+  it('writes a fallback record below the reduction gate, named for the agent', async () => {
+    const { compactHook, fake, writes } = engine(jevFetch(() => 0.95));
+    await compactHook(fake, { trigger: 'auto', agentId: 'agent-1', messages: transcript() }, async () => ({
+      skip: 'next',
+    }));
+    expect(writes).toHaveLength(1);
+    expect(writes[0]!.path.slice(RECORDS.length)).toMatch(/-agent-1-[a-z0-9]+\.json$/);
+    const record = JSON.parse(writes[0]!.text);
+    expect(record).toMatchObject({ agentId: 'agent-1', outcome: 'fallback', messagesIn: 7 });
+    expect(record.detail).toMatch(/^fallback to built-in summary \(below 25% minimum/);
+  });
+
+  it('writes a fallback record when the compaction fails', async () => {
+    const { compactHook, fake, writes } = engine(async () => {
+      throw new Error('Jev down');
+    });
+    await compactHook(fake, { trigger: 'manual', messages: transcript() }, async () => ({ skip: 'next' }));
+    expect(writes).toHaveLength(1);
+    expect(JSON.parse(writes[0]!.text)).toMatchObject({
+      trigger: 'manual',
+      outcome: 'fallback',
+      detail: 'fallback to built-in summary (Jev down)',
+    });
+  });
+
+  it('keeps the result and logs one line when the record cannot be written', async () => {
+    const messages = manyCalls(60);
+    const fetch = jevFetch(() => 0.1);
+    const { compactHook, fake, logs, writes } = engine(fetch, { write: 'EACCES' });
+    const out = (await compactHook(fake, { trigger: 'auto', messages }, async () => ({ skip: 'next' }))) as {
+      messages: SessionMessage[];
+    };
+    expect(writes).toHaveLength(0);
+    expect(logs).toContain('could not write the compaction record (EACCES)');
+    const config = { ...resolveHookConfig({ preserveRecentMessages: 1 }), apiKey: 'k' };
+    expect(out.messages).toEqual((await compactSession(messages, config, fetch)).messages);
+  });
+
+  it('keeps an agent id from leaving the records folder', async () => {
+    const { compactHook, fake, writes } = engine(jevFetch(() => 0.95));
+    await compactHook(fake, { trigger: 'auto', agentId: '../../etc/x', messages: transcript() }, async () => ({
+      skip: 'next',
+    }));
+    expect(writes[0]!.path.startsWith(RECORDS)).toBe(true);
+    expect(writes[0]!.path.slice(RECORDS.length)).not.toMatch(/[/\\]|\.\./);
+  });
+
+  it('keeps a session id from leaving the records folder', async () => {
+    const root = '/home/u/.claude/fast-jev-compaction/records/';
+    const { compactHook, fake, writes } = engine(jevFetch(() => 0.95), { session: '../../../tmp/evil' });
+    await compactHook(fake, { trigger: 'auto', messages: transcript() }, async () => ({ skip: 'next' }));
+    expect(writes[0]!.path.startsWith(root)).toBe(true);
+    const rest = writes[0]!.path.slice(root.length);
+    expect(rest.split('/')).toHaveLength(2);
+    expect(rest).not.toContain('..');
+  });
+
+  it('keeps every path part within 255 bytes for long ids, with a 12-character suffix', async () => {
+    const { compactHook, fake, writes } = engine(jevFetch(() => 0.95), { session: 's'.repeat(300) });
+    await compactHook(fake, { trigger: 'auto', agentId: 'a'.repeat(300), messages: transcript() }, async () => ({
+      skip: 'next',
+    }));
+    expect(writes[0]!.path.split('/').every((part) => Buffer.byteLength(part) <= 255)).toBe(true);
+    expect(writes[0]!.path).toMatch(/-[a-z0-9]{12}\.json$/);
+  });
+
+  it('stops waiting for a record write after RECORD_WAIT_MS and still returns the kept messages', async () => {
+    const messages = manyCalls(60);
+    const fetch = jevFetch(() => 0.1);
+    const { compactHook, fake, logs } = engine(fetch, { write: 'hang' });
+    const started = Date.now();
+    const out = (await compactHook(fake, { trigger: 'auto', messages }, async () => ({ skip: 'next' }))) as {
+      messages: SessionMessage[];
+    };
+    expect(Date.now() - started).toBeLessThan(RECORD_WAIT_MS + 1500);
+    expect(logs).toContain(`the compaction record took over ${RECORD_WAIT_MS} ms; not waiting for it`);
+    const config = { ...resolveHookConfig({ preserveRecentMessages: 1 }), apiKey: 'k' };
+    expect(out.messages).toEqual((await compactSession(messages, config, fetch)).messages);
+  }, 10_000);
+
+  it('falls back unchanged when a record write fails on either fallback path', async () => {
+    const failing = async () => {
+      throw new Error('Jev down');
+    };
+    for (const fetch of [jevFetch(() => 0.95), failing]) {
+      const { compactHook, fake, logs } = engine(fetch, { write: 'EACCES' });
+      let calls = 0;
+      const out = await compactHook(fake, { trigger: 'auto', messages: transcript() }, async () => {
+        calls += 1;
+        return { skip: 'next' };
+      });
+      expect(out).toEqual({ skip: 'next' });
+      expect(calls).toBe(1);
+      expect(logs).toContain('could not write the compaction record (EACCES)');
+    }
+  });
+
+  it('keeps the result when logging a failed record write also fails', async () => {
+    const messages = manyCalls(60);
+    const fetch = jevFetch(() => 0.1);
+    const { compactHook, fake } = engine(fetch, {
+      write: 'EACCES',
+      logThrows: 'could not write the compaction record',
+    });
+    let calls = 0;
+    const out = (await compactHook(fake, { trigger: 'auto', messages }, async () => {
+      calls += 1;
+      return { skip: 'next' };
+    })) as { messages: SessionMessage[] };
+    expect(calls).toBe(0);
+    const config = { ...resolveHookConfig({ preserveRecentMessages: 1 }), apiKey: 'k' };
+    expect(out.messages).toEqual((await compactSession(messages, config, fetch)).messages);
   });
 });
 

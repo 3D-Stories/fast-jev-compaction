@@ -866,11 +866,107 @@ function notify(
   $.ui.toast(text, { timeoutMs: 15_000 });
 }
 
+/**
+ * One compaction's outcome, written to its own file. A session log can lack
+ * this hook's `ui.log` lines (#17); the record shows whether the hook ran and
+ * what it did without depending on that log.
+ */
+export type CompactionRecord = {
+  v: 1;
+  at: string;
+  session: string;
+  agentId: string | null;
+  trigger: string;
+  outcome: 'kept' | 'fallback';
+  messagesIn: number;
+  messagesKept?: number;
+  detail: string;
+};
+
+/** The longest compaction waits for its record to be written. */
+export const RECORD_WAIT_MS = 1000;
+
+/**
+ * A path segment of at most 64 letters, digits, `_` and `-`, so no id can leave
+ * its folder or make a name too long for the file system.
+ */
+function segment(text: string): string {
+  return text.replace(/[^A-Za-z0-9_-]/g, '_').slice(0, 64);
+}
+
+/** Twelve random base-36 characters, so two records of one millisecond keep apart. */
+function recordSuffix(): string {
+  let text = '';
+  while (text.length < 12) text += Math.floor(Math.random() * 36).toString(36);
+  return text;
+}
+
+/** Resolves after `ms`: the hook runtime has `AbortSignal.timeout`, not `setTimeout`. */
+function after(ms: number): Promise<{ kind: 'late' }> {
+  return new Promise((resolve) => {
+    AbortSignal.timeout(ms).addEventListener('abort', () => resolve({ kind: 'late' }), { once: true });
+  });
+}
+
+/** Where a record goes: `~/.claude/fast-jev-compaction/records/<session>/<time>-<main or agent>-<suffix>.json`. */
+export function recordPath(home: string, record: CompactionRecord, suffix: string): string {
+  const name = `${record.at.replace(/[:.]/g, '-')}-${segment(record.agentId ?? 'main')}-${segment(suffix)}.json`;
+  return `${home}/.claude/fast-jev-compaction/records/${segment(record.session)}/${name}`;
+}
+
+type RecordAccess = {
+  env: { get: (name: string) => Promise<string | undefined> };
+  session: { id: () => Promise<string> };
+  fs: { write: (path: string, text: string) => Promise<void> };
+  ui: { log: (text: string) => void };
+};
+
+/**
+ * Writes the record, waiting at most RECORD_WAIT_MS. A failure or a slow write
+ * is logged; neither ever delays the compaction further or changes it.
+ */
+async function writeRecord($: RecordAccess, record: Omit<CompactionRecord, 'v' | 'session'>): Promise<void> {
+  try {
+    const work = (async () => {
+      const home = await $.env.get('HOME');
+      if (!home) throw new Error('HOME is not set');
+      const full: CompactionRecord = { v: 1, session: await $.session.id(), ...record };
+      await $.fs.write(recordPath(home, full, recordSuffix()), `${JSON.stringify(full)}\n`);
+    })();
+    const outcome = await Promise.race([
+      work.then(
+        () => ({ kind: 'written' as const }),
+        (error: unknown) => ({ kind: 'failed' as const, reason: error instanceof Error ? error.message : String(error) }),
+      ),
+      after(RECORD_WAIT_MS),
+    ]);
+    if (outcome.kind === 'late') quietLog($, `the compaction record took over ${RECORD_WAIT_MS} ms; not waiting for it`);
+    if (outcome.kind === 'failed') quietLog($, `could not write the compaction record (${outcome.reason})`);
+  } catch (error) {
+    quietLog($, `could not write the compaction record (${error instanceof Error ? error.message : String(error)})`);
+  }
+}
+
+/** Logs `text`; a log that throws is ignored, because a record never changes the compaction. */
+function quietLog($: { ui: { log: (text: string) => void } }, text: string): void {
+  try {
+    log($, text);
+  } catch {
+    // The compaction's result must not depend on its record's diagnostics.
+  }
+}
+
 export const register: Register = (on: On, options: PluginOptions) => {
   const configured = resolveHookConfig(options);
   let compacting = false;
 
   on('session.compact', async ($, event, next) => {
+    const base = {
+      at: new Date().toISOString(),
+      agentId: event.agentId ?? null,
+      trigger: String(event.trigger),
+      messagesIn: event.messages.length,
+    };
     try {
       log($, inputLine(inputBreakdown(event.messages)));
       const { preserveRecentMessages } = resolveOptions(configured);
@@ -906,21 +1002,21 @@ export const register: Register = (on: On, options: PluginOptions) => {
       for (const line of decisionLogLines(result, UI_LOG_MAX_CHARS, sizes)) log($, line);
       log($, `reach: aims for ${percent(config.minReductionRatio)}; a final tier also cuts old replies of 1,001-2,000 chars`);
       if (reductionRatio(result) < config.minReductionRatio) {
-        notify($, fallbackNotice(result, config.minReductionRatio));
+        const notice = fallbackNotice(result, config.minReductionRatio);
+        notify($, notice);
+        await writeRecord($, { ...base, outcome: 'fallback', detail: notice });
         return next(event);
       }
       const words = withTypedWords(event.messages, messages, typed, result.origins);
       if (words.added > 0) log($, `kept ${words.added} typed message(s) as text: the call each arrived with was dropped or cut`);
-      notify(
-        $,
-        `kept ${words.messages.length}/${event.messages.length} messages, no summary (${summarize(result)})`,
-      );
+      const kept = `kept ${words.messages.length}/${event.messages.length} messages, no summary (${summarize(result)})`;
+      notify($, kept);
+      await writeRecord($, { ...base, outcome: 'kept', messagesKept: words.messages.length, detail: kept });
       return { messages: words.messages };
     } catch (error) {
-      notify(
-        $,
-        `fallback to built-in summary (${error instanceof Error ? error.message : String(error)})`,
-      );
+      const notice = `fallback to built-in summary (${error instanceof Error ? error.message : String(error)})`;
+      notify($, notice);
+      await writeRecord($, { ...base, outcome: 'fallback', detail: notice });
       return next(event);
     }
   });
