@@ -883,9 +883,6 @@ export type CompactionRecord = {
   detail: string;
 };
 
-/** The longest compaction waits for its record to be written. */
-export const RECORD_WAIT_MS = 1000;
-
 /**
  * A path segment of at most 64 letters, digits, `_` and `-`, so no id can leave
  * its folder or make a name too long for the file system.
@@ -899,13 +896,6 @@ function recordSuffix(): string {
   let text = '';
   while (text.length < 12) text += Math.floor(Math.random() * 36).toString(36);
   return text;
-}
-
-/** Resolves after `ms`: the hook runtime has `AbortSignal.timeout`, not `setTimeout`. */
-function after(ms: number): Promise<{ kind: 'late' }> {
-  return new Promise((resolve) => {
-    AbortSignal.timeout(ms).addEventListener('abort', () => resolve({ kind: 'late' }), { once: true });
-  });
 }
 
 /** Where a record goes: `~/.claude/fast-jev-compaction/records/<session>/<time>-<main or agent>-<suffix>.json`. */
@@ -922,28 +912,31 @@ type RecordAccess = {
 };
 
 /**
- * Writes the record, waiting at most RECORD_WAIT_MS. A failure or a slow write
- * is logged; neither ever delays the compaction further or changes it.
+ * Starts writing the record and does not wait for it, so the record never
+ * delays or changes the compaction. A failure is logged when it happens, which
+ * can be after the compaction is done. No declared timer can bound a wait: the
+ * declarations name no `setTimeout`, and `AbortSignal.timeout`, though declared,
+ * is missing in Claude Code 2.1.302's hook runtime (seen live).
  */
-async function writeRecord($: RecordAccess, record: Omit<CompactionRecord, 'v' | 'session'>): Promise<void> {
+function writeRecord($: RecordAccess, record: Omit<CompactionRecord, 'v' | 'session'>): void {
+  (async () => {
+    const home = await $.env.get('HOME');
+    if (!home) throw new Error('HOME is not set');
+    const full: CompactionRecord = { v: 1, session: await $.session.id(), ...record };
+    await $.fs.write(recordPath(home, full, recordSuffix()), `${JSON.stringify(full)}\n`);
+  })().catch((error: unknown) => quietLog($, `could not write the compaction record (${reasonOf(error)})`));
+}
+
+/**
+ * An error's text as a plain string. Never throws: a value or `message` that
+ * String() cannot convert, a non-string `message` and a throwing getter all end here.
+ */
+function reasonOf(error: unknown): string {
   try {
-    const work = (async () => {
-      const home = await $.env.get('HOME');
-      if (!home) throw new Error('HOME is not set');
-      const full: CompactionRecord = { v: 1, session: await $.session.id(), ...record };
-      await $.fs.write(recordPath(home, full, recordSuffix()), `${JSON.stringify(full)}\n`);
-    })();
-    const outcome = await Promise.race([
-      work.then(
-        () => ({ kind: 'written' as const }),
-        (error: unknown) => ({ kind: 'failed' as const, reason: error instanceof Error ? error.message : String(error) }),
-      ),
-      after(RECORD_WAIT_MS),
-    ]);
-    if (outcome.kind === 'late') quietLog($, `the compaction record took over ${RECORD_WAIT_MS} ms; not waiting for it`);
-    if (outcome.kind === 'failed') quietLog($, `could not write the compaction record (${outcome.reason})`);
-  } catch (error) {
-    quietLog($, `could not write the compaction record (${error instanceof Error ? error.message : String(error)})`);
+    const text: unknown = error instanceof Error ? error.message : error;
+    return typeof text === 'string' ? text : String(text);
+  } catch {
+    return 'an error that cannot be shown as text';
   }
 }
 
@@ -1004,19 +997,19 @@ export const register: Register = (on: On, options: PluginOptions) => {
       if (reductionRatio(result) < config.minReductionRatio) {
         const notice = fallbackNotice(result, config.minReductionRatio);
         notify($, notice);
-        await writeRecord($, { ...base, outcome: 'fallback', detail: notice });
+        writeRecord($, { ...base, outcome: 'fallback', detail: notice });
         return next(event);
       }
       const words = withTypedWords(event.messages, messages, typed, result.origins);
       if (words.added > 0) log($, `kept ${words.added} typed message(s) as text: the call each arrived with was dropped or cut`);
       const kept = `kept ${words.messages.length}/${event.messages.length} messages, no summary (${summarize(result)})`;
       notify($, kept);
-      await writeRecord($, { ...base, outcome: 'kept', messagesKept: words.messages.length, detail: kept });
+      writeRecord($, { ...base, outcome: 'kept', messagesKept: words.messages.length, detail: kept });
       return { messages: words.messages };
     } catch (error) {
       const notice = `fallback to built-in summary (${error instanceof Error ? error.message : String(error)})`;
       notify($, notice);
-      await writeRecord($, { ...base, outcome: 'fallback', detail: notice });
+      writeRecord($, { ...base, outcome: 'fallback', detail: notice });
       return next(event);
     }
   });

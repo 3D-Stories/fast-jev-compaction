@@ -7,7 +7,6 @@ import {
   decisionLog,
   decisionLogLines,
   logLines,
-  RECORD_WAIT_MS,
   register,
   resolveHookConfig,
   summarize,
@@ -320,6 +319,8 @@ function engine(
     /** `ui.log` throws for a line that starts with this. */
     logThrows?: string;
     session?: string;
+    /** The write rejects with this value. */
+    rejectWith?: () => unknown;
   } = {},
 ) {
   const handlers: Record<string, Handler> = {};
@@ -360,12 +361,20 @@ function engine(
       list: async () => [],
       write: async (path: string, text: string) => {
         if (errors.write === 'hang') return new Promise<void>(() => undefined);
+        if (errors.rejectWith) return Promise.reject(errors.rejectWith());
         if (errors.write) throw new Error(errors.write);
         writes.push({ path, text });
       },
     },
   };
-  return { compactHook: handlers['session.compact']!, turnHook: handlers['turn.complete']!, fake, logs, toasts, writes };
+  const compact = handlers['session.compact']!;
+  // The record is written without being awaited: let what the hook left running settle before a test looks.
+  const compactHook: Handler = async (...args) => {
+    const out = await compact(...args);
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    return out;
+  };
+  return { compactHook, turnHook: handlers['turn.complete']!, fake, logs, toasts, writes };
 }
 
 function manyCalls(count: number): SessionMessage[] {
@@ -520,7 +529,7 @@ describe('the compaction record (#17)', () => {
     expect(writes[0]!.path).toMatch(/-[a-z0-9]{12}\.json$/);
   });
 
-  it('stops waiting for a record write after RECORD_WAIT_MS and still returns the kept messages', async () => {
+  it('does not wait for a record write that never settles, and still returns the kept messages', async () => {
     const messages = manyCalls(60);
     const fetch = jevFetch(() => 0.1);
     const { compactHook, fake, logs } = engine(fetch, { write: 'hang' });
@@ -528,11 +537,58 @@ describe('the compaction record (#17)', () => {
     const out = (await compactHook(fake, { trigger: 'auto', messages }, async () => ({ skip: 'next' }))) as {
       messages: SessionMessage[];
     };
-    expect(Date.now() - started).toBeLessThan(RECORD_WAIT_MS + 1500);
-    expect(logs).toContain(`the compaction record took over ${RECORD_WAIT_MS} ms; not waiting for it`);
+    expect(Date.now() - started).toBeLessThan(500);
+    expect(logs.filter((line) => line.includes('compaction record'))).toEqual([]);
     const config = { ...resolveHookConfig({ preserveRecentMessages: 1 }), apiKey: 'k' };
     expect(out.messages).toEqual((await compactSession(messages, config, fetch)).messages);
-  }, 10_000);
+  });
+
+  it('logs a write rejected with any value once, and leaves no unhandled rejection', async () => {
+    const throwingMessage = new Error();
+    Object.defineProperty(throwingMessage, 'message', {
+      get: () => {
+        throw new Error('no message');
+      },
+    });
+    const cases: [string, () => unknown, string][] = [
+      ['an ordinary error', () => new Error('EACCES'), 'EACCES'],
+      ['a value String() cannot convert', () => Object.create(null), 'an error that cannot be shown as text'],
+      ['an error whose message String() cannot convert', () => Object.assign(new Error(), { message: Object.create(null) }), 'an error that cannot be shown as text'],
+      ['an error whose message is a symbol', () => Object.assign(new Error(), { message: Symbol('failure') }), 'Symbol(failure)'],
+      ['an error whose message getter throws', () => throwingMessage, 'an error that cannot be shown as text'],
+    ];
+    const unhandled: unknown[] = [];
+    const onUnhandled = (reason: unknown) => unhandled.push(reason);
+    process.on('unhandledRejection', onUnhandled);
+    try {
+      for (const [name, rejectWith, reason] of cases) {
+        const { compactHook, fake, logs } = engine(jevFetch(() => 0.1), { rejectWith });
+        await compactHook(fake, { trigger: 'auto', messages: manyCalls(60) }, async () => ({ skip: 'next' }));
+        await new Promise<void>((resolve) => setImmediate(resolve));
+        expect(logs.filter((line) => line.includes('compaction record')), name).toEqual([
+          `could not write the compaction record (${reason})`,
+        ]);
+      }
+      expect(unhandled).toEqual([]);
+    } finally {
+      process.off('unhandledRejection', onUnhandled);
+    }
+  });
+
+  it('records and logs no failure when the runtime has no AbortSignal.timeout', async () => {
+    // Claude Code 2.1.302's hook runtime has no AbortSignal.timeout, though the declarations name it (seen live).
+    const signal = AbortSignal as { timeout?: unknown };
+    const original = signal.timeout;
+    signal.timeout = undefined;
+    try {
+      const { compactHook, fake, logs, writes } = engine(jevFetch(() => 0.1));
+      await compactHook(fake, { trigger: 'auto', messages: manyCalls(60) }, async () => ({ skip: 'next' }));
+      expect(writes).toHaveLength(1);
+      expect(logs.filter((line) => line.includes('compaction record'))).toEqual([]);
+    } finally {
+      signal.timeout = original;
+    }
+  });
 
   it('falls back unchanged when a record write fails on either fallback path', async () => {
     const failing = async () => {

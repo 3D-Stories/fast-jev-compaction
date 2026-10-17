@@ -130,11 +130,10 @@ session log. The evidence there points to lines lost with the rest of those
 turns rather than a skipped hook, but no debug log confirms it. The record
 shows whether the hook ran without depending on that log. A subagent's record
 sits in its parent session's folder. Ids in the path keep only letters,
-digits, `_` and `-`, at most 64 of them. The hook waits at most 1 second for
-the write; a slower one logs
-`the compaction record took over 1000 ms; not waiting for it`, and a failed
-one logs `could not write the compaction record (<reason>)`. Neither changes
-the compaction. Nothing deletes old records.
+digits, `_` and `-`, at most 64 of them. The hook starts the write and does
+not wait for it, so the record never delays or changes the compaction. A
+failed write logs `could not write the compaction record (<reason>)` when it
+fails, which can be after the compaction is done. Nothing deletes old records.
 
 A message typed while a tool runs reaches the model as a `queued_command`
 attachment on that tool's result message, not as message text, so a dropped
