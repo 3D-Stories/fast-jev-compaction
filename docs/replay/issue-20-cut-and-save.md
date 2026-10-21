@@ -13,12 +13,12 @@ No Jev request was made: `main` is answered by the scores the hook logged.
 
 | Rule | Points | Freed, median | Freed, mean | Freed, p10 | Below 25% | Later-needed outputs | Usable outputs |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-| `main` | 200 | 49.2% | 54.3% | 28.0% | 4 | 1,619 | 24 (1.5%) |
-| `cut-jev@0.30` | 200 | 25.4% | 25.6% | 16.6% | 72 | 1,619 | 700 (43.2%) |
-| `cut-jev@0.45` | 200 | 25.4% | 27.0% | 16.6% | 72 | 1,619 | 679 (41.9%) |
-| `cut-newest@0.30` | 200 | 25.4% | 25.6% | 16.6% | 72 | 1,619 | 701 (43.3%) |
-| `cut-newest@0.45` | 200 | 25.4% | 27.1% | 16.6% | 72 | 1,619 | 678 (41.9%) |
-| `cut-all` | 200 | 25.4% | 27.7% | 16.6% | 72 | 1,619 | 671 (41.4%) |
+| `main` | 200 | 49.2% | 54.3% | 28.0% | 4 | 1,625 | 24 (1.5%) |
+| `cut-jev@0.30` | 200 | 25.4% | 25.6% | 16.6% | 72 | 1,625 | 699 (43.0%) |
+| `cut-jev@0.45` | 200 | 25.4% | 27.0% | 16.6% | 72 | 1,625 | 678 (41.7%) |
+| `cut-newest@0.30` | 200 | 25.4% | 25.6% | 16.6% | 72 | 1,625 | 700 (43.1%) |
+| `cut-newest@0.45` | 200 | 25.4% | 27.1% | 16.6% | 72 | 1,625 | 677 (41.7%) |
+| `cut-all` | 200 | 25.4% | 27.7% | 16.6% | 72 | 1,625 | 670 (41.2%) |
 
 "Freed" is the share of the window's chars (as the hook counts them) the rule removes, whether or not it reaches 25%. Below 25% the hook falls back to the built-in summary, so none of that point's outputs count as usable.
 
@@ -38,7 +38,7 @@ Every output a cut rule cuts can be read back whole from its saved file. That is
 
 ## Fidelity
 
-- Session logs read: 769. Sessions with a compaction in the range: 34.
+- Session logs read: 770. Sessions with a compaction in the range: 34.
 - Compaction points found: 982 (72 more copies of one of them met in a second log file of the same session, counted once).
 - Excluded: 88.
   - no `input:` line from the hook for the compaction: 27

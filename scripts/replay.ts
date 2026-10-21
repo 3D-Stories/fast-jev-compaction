@@ -130,7 +130,7 @@ function privateStrings(logs: readonly LogSource[]): Set<string> {
  * The replay: pass one finds every compaction point in the range and validates it; a seeded,
  * session-stratified sample of the points that pass is drawn; pass two replays every rule on each
  * sampled point and labels its old outputs from what the session wrote later. Exit 1, and no report,
- * when fewer than `minPoints` points pass.
+ * when fewer than `minPoints` points pass, or are sampled.
  */
 export async function runReplay(options: ReplayOptions): Promise<{ exitCode: number; markdown?: string; summary: string[] }> {
   const progress = options.progress ?? (() => {});
@@ -180,6 +180,10 @@ export async function runReplay(options: ReplayOptions): Promise<{ exitCode: num
   }
 
   const sample = stratifiedSample(usable, options.sample, options.seed);
+  if (sample.length < options.minPoints) {
+    summary.push(`sampled: ${sample.length}, fewer than ${options.minPoints}: no report`);
+    return { exitCode: 1, summary };
+  }
   const sampleIndex = new Map(sample.map((point, index) => [point.key, index]));
   const numbers: PointNumbers[] = [];
   const largest = new Map<RuleName, number>();
@@ -346,7 +350,7 @@ const DAY = /^\d{4}-\d\d-\d\d$/;
 
 type Args = { since: string; until: string; out: string; seed: number; sample: number; minPoints: number; projects?: string; records?: string };
 
-function parseArgs(argv: readonly string[]): Args {
+export function parseArgs(argv: readonly string[]): Args {
   const values = new Map<string, string>();
   for (let i = 0; i < argv.length; i += 2) {
     const flag = argv[i]!;
@@ -367,6 +371,8 @@ function parseArgs(argv: readonly string[]): Args {
     return value;
   };
   const args: Args = { since, until, out, seed: number('seed', 20), sample: number('sample', 200), minPoints: number('min-points', 100) };
+  if (args.minPoints < 100) throw new Error('--min-points takes 100 or more: the report rests on at least 100 real points');
+  if (args.sample < args.minPoints) throw new Error(`--sample takes at least --min-points (${args.minPoints}): the report rests on the sampled points`);
   const projects = values.get('projects');
   if (projects) args.projects = projects;
   const records = values.get('records');

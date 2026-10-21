@@ -106,6 +106,28 @@ function resultText(content: unknown): string {
     .join('\n');
 }
 
+/**
+ * A tool input's text as tokens are read from it: its keys and string values decoded, numbers and booleans
+ * as `String()` gives them, in key order, one per line. Not its JSON text, where a newline is `\n` and the
+ * n glues onto the token after it. The walk keeps its own stack, so no depth of nesting overflows.
+ */
+export function inputStrings(input: unknown): string {
+  const strings: string[] = [];
+  const stack: unknown[] = [input];
+  while (stack.length > 0) {
+    const value = stack.pop();
+    if (typeof value === 'string') strings.push(value);
+    else if (typeof value === 'number' || typeof value === 'boolean') strings.push(String(value));
+    else if (Array.isArray(value)) for (let i = value.length - 1; i >= 0; i -= 1) stack.push(value[i]);
+    else if (isObject(value)) {
+      const entries = Object.entries(value);
+      // Pushed last, a key comes off the stack before its value.
+      for (let i = entries.length - 1; i >= 0; i -= 1) stack.push(entries[i]![1], entries[i]![0]);
+    }
+  }
+  return strings.join('\n');
+}
+
 /** One message per entry, in `SessionMessage`'s shape, before tool outcomes are mirrored onto the calls. */
 function hold(entry: Entry): Held {
   const role = entry.type === 'assistant' ? 'assistant' : 'user';
@@ -274,7 +296,7 @@ export class LogReader {
     const at = str(entry.timestamp);
     if (held.message.role !== 'assistant' || at <= this.lastBoundaryAt) return [];
     const texts = held.message.text ? [held.message.text] : [];
-    for (const tool of held.message.toolUses) texts.push(JSON.stringify(tool.input));
+    for (const tool of held.message.toolUses) texts.push(inputStrings(tool.input));
     return texts.length > 0 ? [{ kind: 'later', at, texts }] : [];
   }
 

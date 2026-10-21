@@ -1,10 +1,10 @@
 import { describe, expect, it } from 'vitest';
 import { boundsLine, callSizes, inputBreakdown, inputLine, logLines } from '../hooks/fast-jev.ts';
 import type { Message } from '../src/index.js';
-import { Labels } from '../scripts/replay/labels.ts';
+import { distinctiveTokens, Labels } from '../scripts/replay/labels.ts';
 import { joinParts, LogReader, validate, type LoggedDecision, type Point } from '../scripts/replay/log.ts';
 import { runCut, runMain, runRules } from '../scripts/replay/rules.ts';
-import { runReplay, stratifiedSample } from '../scripts/replay.ts';
+import { parseArgs, runReplay, stratifiedSample } from '../scripts/replay.ts';
 
 const SESSION = '0f0f0f0f-1111-2222-3333-444444444444';
 
@@ -298,7 +298,7 @@ describe('replay R3: the logged decisions', () => {
 });
 
 /** Five calls whose outputs hold a distinctive token at the head, middle and tail of a long output, in a short one, and none. */
-function labelLog(): LogLines {
+function labelLog(laterCommand = 'cat TAILTOKEN_0003'): LogLines {
   const log = new LogLines();
   log.user('Start');
   const outputs: [string, string][] = [
@@ -319,7 +319,7 @@ function labelLog(): LogLines {
   log.boundary();
   log.user('please use WHOLETOKEN_0004');
   log.assistant([text('Using HEADTOKEN_0001, MIDTOKEN_0002 and shared_77777.')]);
-  log.assistant([toolUse('later-1', 'Bash', { command: 'cat TAILTOKEN_0003' })]);
+  log.assistant([toolUse('later-1', 'Bash', { command: laterCommand })]);
   return log;
 }
 
@@ -334,8 +334,11 @@ function decided(entries: [string, string, LoggedDecision['action'], number, num
 }
 
 describe('replay R4: labels', () => {
-  it('labels an old output by its distinctive token reused first in later assistant text or tool input', async () => {
-    const log = labelLog();
+  // A tool input is read by its strings: in its JSON text a newline is `\n`, whose n would glue onto the token.
+  const laterCommands = ['cat TAILTOKEN_0003', 'cat\nTAILTOKEN_0003'];
+
+  it.each(laterCommands)('labels an old output by its distinctive token reused first in later assistant text or tool input (%j)', async (command) => {
+    const log = labelLog(command);
     const reader = new LogReader('session.jsonl', SESSION);
     const labels = new Labels();
     for (const line of log.lines) {
@@ -371,6 +374,22 @@ describe('replay R4: labels', () => {
       { toolUseId: 'h-3', label: 'TAILTOKEN_0003', main: false, cutAll: true },
     ]);
     expect(labels.counts(0)).toMatchObject({ needed: 3, usable: { main: 1, 'cut-all': 2 } });
+  });
+
+  it('does not count a token as distinctive of an output when another tool input holds it after a tab', () => {
+    const window: Message[] = [message('user', 'Start')];
+    for (const [id, command, output] of [
+      ['h-3', 'h-3', 'TAILTOKEN_0003 OWNTOKEN_0033'],
+      ['h-6', 'grep\tTAILTOKEN_0003', 'no match'],
+    ] as const) {
+      window.push(
+        message('assistant', '', { toolUses: [{ tool_use_id: id, tool: 'Bash', input: { command }, text: output }] }),
+        message('user', '', { toolResults: [{ tool_use_id: id, text: output, isError: false }] }),
+      );
+    }
+    for (let i = 0; i < 3; i += 1) window.push(message('assistant', 'ok'), message('user', 'go'));
+
+    expect(distinctiveTokens(window)).toEqual(new Map([['h-3', ['OWNTOKEN_0033']]]));
   });
 });
 
@@ -513,7 +532,7 @@ describe('replay R6: the report and the run', () => {
     return log;
   }
 
-  function replay(minPoints: number) {
+  function replay(minPoints: number, sample = 200) {
     const log = privateLog();
     return runReplay({
       logs: [{ file: PRIVATE_FILE, session: PRIVATE_SESSION, lines: () => log.lines }],
@@ -521,7 +540,7 @@ describe('replay R6: the report and the run', () => {
       since: '2026-10-17',
       until: '2026-10-20',
       seed: 20,
-      sample: 200,
+      sample,
       minPoints,
       command: 'npm run replay -- --since 2026-10-17 --until 2026-10-20',
       runDate: '2026-10-20',
@@ -539,10 +558,25 @@ describe('replay R6: the report and the run', () => {
     }
   });
 
-  it('exits 1 and writes no report when fewer points validate than the minimum', async () => {
-    const { exitCode, markdown } = await replay(2);
-    expect(exitCode).toBe(1);
-    expect(markdown).toBeUndefined();
+  it('exits 1 and writes no report when fewer points validate, or are sampled, than the minimum', async () => {
+    // One point validates: a minimum of 2 is not met, and a sample of 0 replays none.
+    for (const [minPoints, sample] of [
+      [2, 200],
+      [1, 0],
+    ] as const) {
+      const { exitCode, markdown } = await replay(minPoints, sample);
+      expect(exitCode).toBe(1);
+      expect(markdown).toBeUndefined();
+    }
+  });
+
+  it('refuses a minimum under 100 points, and a sample smaller than the minimum', () => {
+    const args = ['--since', '2026-10-17', '--until', '2026-10-20', '--out', 'report.md'];
+    expect(() => parseArgs([...args, '--min-points', '99'])).toThrow(/--min-points/);
+    expect(() => parseArgs([...args, '--min-points', '0'])).toThrow(/--min-points/);
+    expect(() => parseArgs([...args, '--sample', '50'])).toThrow(/--sample/);
+    expect(parseArgs([...args, '--sample', '100'])).toMatchObject({ sample: 100, minPoints: 100 });
+    expect(parseArgs(args)).toMatchObject({ sample: 200, minPoints: 100 });
   });
 
   it('draws the same seeded sample every time, spread across sessions before any session gives a second point', () => {

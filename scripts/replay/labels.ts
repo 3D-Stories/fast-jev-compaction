@@ -1,6 +1,7 @@
 import { DEFAULT_OPTIONS } from '../../src/compact.js';
 import { collectToolCalls } from '../../src/state.js';
 import type { Message } from '../../src/types.js';
+import { inputStrings } from './log.js';
 import type { RuleName, RuleRun } from './rules.js';
 
 /** A maximal run of these chars, starting and ending with a letter or digit. */
@@ -14,14 +15,6 @@ export function tokensOf(text: string): string[] {
   const found: string[] = [];
   for (const [token] of text.matchAll(TOKEN)) if (token.length >= TOKEN_MIN && MARK.test(token)) found.push(token);
   return found;
-}
-
-function inputText(input: Record<string, unknown>): string {
-  try {
-    return JSON.stringify(input) ?? '';
-  } catch {
-    return '';
-  }
 }
 
 /**
@@ -46,7 +39,7 @@ export function distinctiveTokens(window: readonly Message[]): Map<string, strin
   };
   window.forEach((message, index) => {
     note(message.text, `text ${index}`);
-    message.toolUses.forEach((tool, toolIndex) => note(inputText(tool.input), `input ${index} ${toolIndex}`));
+    message.toolUses.forEach((tool, toolIndex) => note(inputStrings(tool.input), `input ${index} ${toolIndex}`));
     for (const result of message.toolResults ?? []) {
       note(result.text, old.has(result.tool_use_id) ? `old ${result.tool_use_id}` : `output ${index} ${result.tool_use_id}`);
     }
